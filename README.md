@@ -23,9 +23,6 @@ tokio = { version = "1", features = ["full"] }
 
 ### Example
 
-This is how it is supposed to work.
-The library is still work in progress and might not work yet.
-
 ```rust
 use async_py::PyRunner;
 
