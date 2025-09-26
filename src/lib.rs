@@ -19,15 +19,15 @@ enum CmdType {
     CallFunction { name: String, args: Vec<Value> },
     Stop,
 }
-/// Represents a command to be sent to the Python execution thread.
-/// It includes the Python code to run and a one-shot channel sender
-/// to send the result back.
+/// Represents a command to be sent to the Python execution thread. It includes the
+/// command to execute and a one-shot channel sender to send the `serde_json::Value`
+/// result back.
 struct PyCommand {
     cmd_type: CmdType,
     responder: oneshot::Sender<PyResult<Value>>,
 }
 
-/// Custom error types for the Python executor.
+/// Custom error types for the `PyRunner`.
 #[derive(Error, Debug)]
 pub enum PyRunnerError {
     #[error("Failed to send command to Python thread. The thread may have panicked.")]
@@ -87,7 +87,7 @@ pub struct PyRunner {
 }
 
 impl PyRunner {
-    /// Creates a new `PythonExecutor` and spawns a dedicated thread for Python execution.
+    /// Creates a new `PyRunner` and spawns a dedicated thread for Python execution.
     ///
     /// This thread initializes the Python interpreter and waits for commands.
     ///
@@ -147,9 +147,10 @@ impl PyRunner {
     }
 
     /// Asynchronously executes a block of Python code.
-    ///*   `code`: A string slice containing the Python code to execute.
-    /// Returns a `Result` containing the Python module object on success,
-    /// or a `PyRunnerError` on failure.
+    ///
+    /// * `code`: A string slice containing the Python code to execute.
+    /// Returns `Ok(Value::Null)` on success, or a `PyRunnerError` on failure.
+    /// This is equivalent to Python's `exec()` function.
     pub async fn run(&self, code: &str) -> Result<Value, PyRunnerError> {
         // Create a one-shot channel to receive the result from the Python thread.
         let (responder, receiver) = oneshot::channel();
@@ -172,6 +173,13 @@ impl PyRunner {
 
         Ok(result)
     }
+
+    /// Asynchronously evaluates a single Python expression.
+    ///
+    /// * `code`: A string slice containing the Python expression to evaluate.
+    ///           Must not contain definitions or multiple lines.
+    /// Returns a `Result` containing the expression's result as a `serde_json::Value` on success,
+    /// or a `PyRunnerError` on failure. This is equivalent to Python's `eval()` function.
     pub async fn eval(&self, code: &str) -> Result<Value, PyRunnerError> {
         // Create a one-shot channel to receive the result from the Python thread.
         let (responder, receiver) = oneshot::channel();
@@ -195,6 +203,11 @@ impl PyRunner {
         Ok(result)
     }
 
+    /// Asynchronously reads a variable from the Python interpreter's global scope.
+    ///
+    /// * `var_name`: The name of the variable to read. It can be a dot-separated path
+    ///   to access attributes of objects (e.g., "my_module.my_variable").
+    /// Returns the variable's value as a `serde_json::Value` on success.
     pub async fn read_variable(&self, var_name: &str) -> Result<Value, PyRunnerError> {
         let (responder, receiver) = oneshot::channel();
         let cmd_type = CmdType::ReadVariable(var_name.into());
@@ -215,6 +228,12 @@ impl PyRunner {
         Ok(result)
     }
 
+    /// Asynchronously calls a Python function in the interpreter's global scope.
+    ///
+    /// * `name`: The name of the function to call. It can be a dot-separated path
+    ///   to access functions within modules (e.g., "my_module.my_function").
+    /// * `args`: A vector of `serde_json::Value` to pass as arguments to the function.
+    /// Returns the function's return value as a `serde_json::Value` on success.
     pub async fn call_function(
         &self,
         name: &str,
@@ -242,6 +261,7 @@ impl PyRunner {
         Ok(result)
     }
 
+    /// Stops the Python execution thread gracefully.
     pub async fn stop(&self) -> Result<(), PyRunnerError> {
         let (responder, receiver) = oneshot::channel();
         let cmd_type = CmdType::Stop;
