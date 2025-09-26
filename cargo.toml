@@ -1,0 +1,9 @@
+[package]
+name = "async_py"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pyo3 = { version = "0.26.0", features = ["auto-initialize"] }
+tokio = { version = "1", features = ["full"] }
+thiserror = "2.0"
