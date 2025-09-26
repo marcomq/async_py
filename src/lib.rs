@@ -146,15 +146,11 @@ impl PyRunner {
         Self { sender }
     }
 
-    /// Asynchronously executes a block of Python code.
-    ///
-    /// * `code`: A string slice containing the Python code to execute.
-    /// Returns `Ok(Value::Null)` on success, or a `PyRunnerError` on failure.
-    /// This is equivalent to Python's `exec()` function.
-    pub async fn run(&self, code: &str) -> Result<Value, PyRunnerError> {
+    /// A private helper function to encapsulate the logic of sending a command
+    /// and receiving a response.
+    async fn send_command(&self, cmd_type: CmdType) -> Result<Value, PyRunnerError> {
         // Create a one-shot channel to receive the result from the Python thread.
         let (responder, receiver) = oneshot::channel();
-        let cmd_type = CmdType::RunCode(code.into());
         let cmd = PyCommand {
             cmd_type,
             responder,
@@ -174,6 +170,16 @@ impl PyRunner {
         Ok(result)
     }
 
+
+    /// Asynchronously executes a block of Python code.
+    ///
+    /// * `code`: A string slice containing the Python code to execute.
+    /// Returns `Ok(Value::Null)` on success, or a `PyRunnerError` on failure.
+    /// This is equivalent to Python's `exec()` function.
+    pub async fn run(&self, code: &str) -> Result<Value, PyRunnerError> {
+        self.send_command(CmdType::RunCode(code.into())).await
+    }
+    
     /// Asynchronously evaluates a single Python expression.
     ///
     /// * `code`: A string slice containing the Python expression to evaluate.
@@ -181,26 +187,7 @@ impl PyRunner {
     /// Returns a `Result` containing the expression's result as a `serde_json::Value` on success,
     /// or a `PyRunnerError` on failure. This is equivalent to Python's `eval()` function.
     pub async fn eval(&self, code: &str) -> Result<Value, PyRunnerError> {
-        // Create a one-shot channel to receive the result from the Python thread.
-        let (responder, receiver) = oneshot::channel();
-        let cmd_type = CmdType::EvalCode(code.into());
-        let cmd = PyCommand {
-            cmd_type,
-            responder,
-        };
-
-        // Send the command to the Python thread.
-        self.sender
-            .send(cmd)
-            .await
-            .map_err(|_| PyRunnerError::SendCommandFailed)?;
-
-        // Await the result from the Python thread.
-        let result = receiver
-            .await
-            .map_err(|_| PyRunnerError::ReceiveResultFailed)??;
-
-        Ok(result)
+        self.send_command(CmdType::EvalCode(code.into())).await
     }
 
     /// Asynchronously reads a variable from the Python interpreter's global scope.
@@ -209,23 +196,7 @@ impl PyRunner {
     ///   to access attributes of objects (e.g., "my_module.my_variable").
     /// Returns the variable's value as a `serde_json::Value` on success.
     pub async fn read_variable(&self, var_name: &str) -> Result<Value, PyRunnerError> {
-        let (responder, receiver) = oneshot::channel();
-        let cmd_type = CmdType::ReadVariable(var_name.into());
-        let cmd = PyCommand {
-            cmd_type,
-            responder,
-        };
-
-        self.sender
-            .send(cmd)
-            .await
-            .map_err(|_| PyRunnerError::SendCommandFailed)?;
-
-        let result = receiver
-            .await
-            .map_err(|_| PyRunnerError::ReceiveResultFailed)??;
-
-        Ok(result)
+        self.send_command(CmdType::ReadVariable(var_name.into())).await
     }
 
     /// Asynchronously calls a Python function in the interpreter's global scope.
@@ -239,45 +210,16 @@ impl PyRunner {
         name: &str,
         args: Vec<Value>,
     ) -> Result<Value, PyRunnerError> {
-        let (responder, receiver) = oneshot::channel();
-        let cmd_type = CmdType::CallFunction {
+        self.send_command(CmdType::CallFunction {
             name: name.into(),
             args,
-        };
-        let cmd = PyCommand {
-            cmd_type,
-            responder,
-        };
-
-        self.sender
-            .send(cmd)
-            .await
-            .map_err(|_| PyRunnerError::SendCommandFailed)?;
-
-        let result = receiver
-            .await
-            .map_err(|_| PyRunnerError::ReceiveResultFailed)??;
-
-        Ok(result)
+        }).await
     }
 
     /// Stops the Python execution thread gracefully.
     pub async fn stop(&self) -> Result<(), PyRunnerError> {
-        let (responder, receiver) = oneshot::channel();
-        let cmd_type = CmdType::Stop;
-        let cmd = PyCommand {
-            cmd_type,
-            responder,
-        };
-
-        self.sender
-            .send(cmd)
-            .await
-            .map_err(|_| PyRunnerError::SendCommandFailed)?;
-
-        let _wait = receiver
-            .await
-            .map_err(|_| PyRunnerError::ReceiveResultFailed)??;
+        // We can ignore the `Ok(Value::Null)` result.
+        self.send_command(CmdType::Stop).await?;
         Ok(())
     }
 }
