@@ -40,6 +40,46 @@ pub enum PyRunnerError {
     PyError(#[from] PyErr),
 }
 
+/// Resolves a potentially dot-separated Python object name from the globals dictionary.
+fn get_py_object<'py>(
+    globals: &pyo3::Bound<'py, PyDict>,
+    name: &str,
+) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+    let mut parts = name.split('.');
+    let first_part = parts.next().unwrap(); // split always yields at least one item
+
+    let mut obj = globals
+        .get_item(first_part)?
+        .ok_or_else(|| PyErr::new::<PyKeyError, _>(format!("'{}' not found", first_part)))?;
+
+    for part in parts {
+        obj = obj.getattr(part)?;
+    }
+
+    Ok(obj)
+}
+
+/// Handles the `CallFunction` command.
+fn handle_call_function(
+    py: Python,
+    globals: &pyo3::Bound<'_, PyDict>,
+    name: String,
+    args: Vec<Value>,
+) -> PyResult<Value> {
+    let func = get_py_object(globals, &name)?;
+
+    if !func.is_callable() {
+        return Err(PyErr::new::<PyKeyError, _>(format!(
+            "'{}' is not a callable function",
+            name
+        )));
+    }
+
+    let py_args = args.into_iter().map(|v| json_value_to_pyobject(py, v)).collect::<PyResult<Vec<_>>>()?;
+    let t_args = pyo3::types::PyTuple::new(py, py_args)?;
+    let result = func.call1(t_args)?;
+    py_any_to_json(py, &result)
+}
 /// Manages a dedicated thread for executing Python code asynchronously.
 #[derive(Clone)]
 pub struct PyRunner {
@@ -86,96 +126,13 @@ impl PyRunner {
                                 .send(result.and_then(|obj| py_any_to_json(py, &obj)));
                         }
                         CmdType::ReadVariable(var_name) => {
-                            let var_dot_split: Vec<&str> = var_name.split(".").collect();
-                            let var = globals.get_item(var_dot_split[0]);
-                            if let Ok(Some(var_obj)) = var {
-                                let res = if var_dot_split.len() > 2 {
-                                    match var_obj.getattr(var_dot_split.get(1).unwrap()) {
-                                        Ok(v) => v.getattr(var_dot_split.get(2).unwrap()),
-                                        Err(e) => Err(e),
-                                    }
-                                } else if var_dot_split.len() > 1 {
-                                    var_obj.getattr(var_dot_split.get(1).unwrap())
-                                } else {
-                                    Ok(var_obj)
-                                };
-                                let _ = cmd
-                                    .responder
-                                    .send(res.and_then(|obj| py_any_to_json(py, &obj)));
-                            } else {
-                                let _ = cmd.responder.send(Err(PyErr::new::<PyKeyError, _>(
-                                    format!("Variable '{}' not found", var_name),
-                                )
-                                .into()));
-                            };
+                            let result = get_py_object(&globals, &var_name)
+                                .and_then(|obj| py_any_to_json(py, &obj));
+                            let _ = cmd.responder.send(result);
                         }
                         CmdType::CallFunction { name, args } => {
-                            let fn_dot_split: Vec<&str> = name.split(".").collect();
-                            let app_res = globals.get_item(fn_dot_split[0]);
-                            let Ok(Some(app)) = app_res else {
-                                let _ = cmd.responder.send(Err(PyErr::new::<PyKeyError, _>(
-                                    format!("Function '{}' not found", name),
-                                )
-                                .into()));
-                                continue;
-                            };
-                            let app = if fn_dot_split.len() > 2 {
-                                let first = app.getattr(fn_dot_split.get(1).unwrap());
-                                if let Ok(first) = first {
-                                    first.getattr(fn_dot_split.get(2).unwrap())
-                                } else {
-                                    let _ = cmd.responder.send(Err(PyErr::new::<PyKeyError, _>(
-                                        format!("Function '{}' not found", name),
-                                    )
-                                    .into()));
-                                    continue;
-                                }
-                            } else if fn_dot_split.len() > 1 {
-                                app.getattr(fn_dot_split.get(1).unwrap())
-                            } else {
-                                Ok(app)
-                            };
-
-                            if let Ok(app) = app {
-                                if app.is_callable() {
-                                    let py_args = args
-                                        .into_iter()
-                                        .map(|v| json_value_to_pyobject(py, v))
-                                        .collect::<PyResult<Vec<_>>>();
-                                    match py_args {
-                                        Ok(py_args) => {
-                                            let Ok(t_args) = pyo3::types::PyTuple::new(py, py_args)
-                                            else {
-                                                let _ = cmd.responder.send(Err(PyErr::new::<
-                                                    PyKeyError,
-                                                    _,
-                                                >(
-                                                    "Failed to create argument tuple",
-                                                )
-                                                .into()));
-                                                continue;
-                                            };
-                                            let res = app.call1(t_args);
-                                            let _ = cmd
-                                                .responder
-                                                .send(res.and_then(|obj| py_any_to_json(py, &obj)));
-                                        }
-                                        Err(e) => {
-                                            let _ = cmd.responder.send(Err(e));
-                                        }
-                                    }
-                                } else {
-                                    let _ = cmd.responder.send(Err(PyErr::new::<PyKeyError, _>(
-                                        format!("'{}' not a callable function", name),
-                                    )
-                                    .into()));
-                                }
-                            } else {
-                                let _ = cmd.responder.send(Err(PyErr::new::<PyKeyError, _>(
-                                    format!("Function '{}' not found", name),
-                                )
-                                .into()));
-                            }
+                            let result = handle_call_function(py, &globals, name, args);
+                            let _ = cmd.responder.send(result);
                         }
                         CmdType::Stop => {
                             let _ = cmd.responder.send(Ok(Value::Null));
@@ -368,14 +325,14 @@ fn json_value_to_pyobject(py: Python, value: Value) -> PyResult<pyo3::Py<pyo3::P
             for v in arr {
                 py_list.append(json_value_to_pyobject(py, v)?)?;
             }
-            Ok(py_list.into())
+            py_list.into_py_any(py)
         }
         Value::Object(obj) => {
             let py_dict = pyo3::types::PyDict::new(py);
             for (k, v) in obj {
                 py_dict.set_item(k, json_value_to_pyobject(py, v)?)?;
             }
-            Ok(py_dict.into())
+            py_dict.into_py_any(py)
         }
     }
 }
