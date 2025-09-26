@@ -1,6 +1,13 @@
 //! A library for calling Python code asynchronously from Rust.
 
-use pyo3::{exceptions::PyKeyError, ffi::c_str, prelude::*, types::PyDict};
+use pyo3::{
+    exceptions::PyKeyError,
+    ffi::c_str,
+    prelude::*,
+    types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString},
+    IntoPyObjectExt,
+};
+use serde_json::Value;
 use std::{ffi::CString, thread};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -9,7 +16,7 @@ enum CmdType {
     RunCode(String),
     EvalCode(String),
     ReadVariable(String),
-    CallFunction { name: String, args: Vec<Py<PyAny>> },
+    CallFunction { name: String, args: Vec<Value> },
     Stop,
 }
 /// Represents a command to be sent to the Python execution thread.
@@ -17,7 +24,7 @@ enum CmdType {
 /// to send the result back.
 struct PyCommand {
     cmd_type: CmdType,
-    responder: oneshot::Sender<PyResult<Py<PyAny>>>,
+    responder: oneshot::Sender<PyResult<Value>>,
 }
 
 /// Custom error types for the Python executor.
@@ -69,28 +76,32 @@ impl PyRunner {
                         CmdType::RunCode(code) => {
                             let c_code = CString::new(code).expect("CString::new failed");
                             let result = py.run(&c_code, Some(&globals), None);
-                            let _ = cmd.responder.send(result.map(|_m| py.None()));
+                            let _ = cmd.responder.send(result.map(|_| Value::Null));
                         }
                         CmdType::EvalCode(code) => {
                             let c_code = CString::new(code).expect("CString::new failed");
                             let result = py.eval(&c_code, Some(&globals), None);
-                            let _ = cmd.responder.send(result.map(|m| m.into()));
+                            let _ = cmd
+                                .responder
+                                .send(result.and_then(|obj| py_any_to_json(py, &obj)));
                         }
                         CmdType::ReadVariable(var_name) => {
                             let var_dot_split: Vec<&str> = var_name.split(".").collect();
                             let var = globals.get_item(var_dot_split[0]);
-                            if let Ok(Some(var)) = var {
+                            if let Ok(Some(var_obj)) = var {
                                 let res = if var_dot_split.len() > 2 {
-                                    match var.getattr(var_dot_split.get(1).unwrap()) {
+                                    match var_obj.getattr(var_dot_split.get(1).unwrap()) {
                                         Ok(v) => v.getattr(var_dot_split.get(2).unwrap()),
                                         Err(e) => Err(e),
                                     }
                                 } else if var_dot_split.len() > 1 {
-                                    var.getattr(var_dot_split.get(1).unwrap())
+                                    var_obj.getattr(var_dot_split.get(1).unwrap())
                                 } else {
-                                    Ok(var)
+                                    Ok(var_obj)
                                 };
-                                let _ = cmd.responder.send(res.map(|m| m.into()));
+                                let _ = cmd
+                                    .responder
+                                    .send(res.and_then(|obj| py_any_to_json(py, &obj)));
                             } else {
                                 let _ = cmd.responder.send(Err(PyErr::new::<PyKeyError, _>(
                                     format!("Variable '{}' not found", var_name),
@@ -99,7 +110,6 @@ impl PyRunner {
                             };
                         }
                         CmdType::CallFunction { name, args } => {
-                            dbg!(&globals);
                             let fn_dot_split: Vec<&str> = name.split(".").collect();
                             let app_res = globals.get_item(fn_dot_split[0]);
                             let Ok(Some(app)) = app_res else {
@@ -128,18 +138,32 @@ impl PyRunner {
 
                             if let Ok(app) = app {
                                 if app.is_callable() {
-                                    let t_args = pyo3::types::PyTuple::new(py, args);
-                                    if let Ok(t_args) = t_args {
-                                        let res = app.call1(t_args);
-                                        let _ = cmd.responder.send(res.map(|m| m.into()));
+                                    let py_args = args
+                                        .into_iter()
+                                        .map(|v| json_value_to_pyobject(py, v))
+                                        .collect::<PyResult<Vec<_>>>();
+                                    match py_args {
+                                        Ok(py_args) => {
+                                            let Ok(t_args) = pyo3::types::PyTuple::new(py, py_args)
+                                            else {
+                                                let _ = cmd.responder.send(Err(PyErr::new::<
+                                                    PyKeyError,
+                                                    _,
+                                                >(
+                                                    "Failed to create argument tuple",
+                                                )
+                                                .into()));
+                                                continue;
+                                            };
+                                            let res = app.call1(t_args);
+                                            let _ = cmd
+                                                .responder
+                                                .send(res.and_then(|obj| py_any_to_json(py, &obj)));
+                                        }
+                                        Err(e) => {
+                                            let _ = cmd.responder.send(Err(e));
+                                        }
                                     }
-                                    else {
-                                        let _ = cmd.responder.send(Err(PyErr::new::<PyKeyError, _>(
-                                    format!("Function parameters cannot be applied to {name}"),
-                                )
-                                .into()));
-                                    }
-                                    
                                 } else {
                                     let _ = cmd.responder.send(Err(PyErr::new::<PyKeyError, _>(
                                         format!("'{}' not a callable function", name),
@@ -152,10 +176,11 @@ impl PyRunner {
                                 )
                                 .into()));
                             }
-                        },
+                        }
                         CmdType::Stop => {
-                            let _ = cmd.responder.send(Ok(py.None()));
-                            break},
+                            let _ = cmd.responder.send(Ok(Value::Null));
+                            break;
+                        }
                     };
                 }
             });
@@ -167,8 +192,8 @@ impl PyRunner {
     /// Asynchronously executes a block of Python code.
     ///*   `code`: A string slice containing the Python code to execute.
     /// Returns a `Result` containing the Python module object on success,
-    /// or a `PythonExecutorError` on failure.
-    pub async fn run(&self, code: &str) -> Result<Py<PyAny>, PyRunnerError> {
+    /// or a `PyRunnerError` on failure.
+    pub async fn run(&self, code: &str) -> Result<Value, PyRunnerError> {
         // Create a one-shot channel to receive the result from the Python thread.
         let (responder, receiver) = oneshot::channel();
         let cmd_type = CmdType::RunCode(code.into());
@@ -190,7 +215,7 @@ impl PyRunner {
 
         Ok(result)
     }
-    pub async fn eval(&self, code: &str) -> Result<Py<PyAny>, PyRunnerError> {
+    pub async fn eval(&self, code: &str) -> Result<Value, PyRunnerError> {
         // Create a one-shot channel to receive the result from the Python thread.
         let (responder, receiver) = oneshot::channel();
         let cmd_type = CmdType::EvalCode(code.into());
@@ -213,7 +238,7 @@ impl PyRunner {
         Ok(result)
     }
 
-    pub async fn read_variable(&self, var_name: &str) -> Result<Py<PyAny>, PyRunnerError> {
+    pub async fn read_variable(&self, var_name: &str) -> Result<Value, PyRunnerError> {
         let (responder, receiver) = oneshot::channel();
         let cmd_type = CmdType::ReadVariable(var_name.into());
         let cmd = PyCommand {
@@ -236,8 +261,8 @@ impl PyRunner {
     pub async fn call_function(
         &self,
         name: &str,
-        args: Vec<Py<PyAny>>,
-    ) -> Result<Py<PyAny>, PyRunnerError> {
+        args: Vec<Value>,
+    ) -> Result<Value, PyRunnerError> {
         let (responder, receiver) = oneshot::channel();
         let cmd_type = CmdType::CallFunction {
             name: name.into(),
@@ -260,11 +285,9 @@ impl PyRunner {
         Ok(result)
     }
 
-    pub async fn stop(
-        &self,
-    ) -> Result<(), PyRunnerError> {
+    pub async fn stop(&self) -> Result<(), PyRunnerError> {
         let (responder, receiver) = oneshot::channel();
-        let cmd_type = CmdType::Stop ;
+        let cmd_type = CmdType::Stop;
         let cmd = PyCommand {
             cmd_type,
             responder,
@@ -282,10 +305,78 @@ impl PyRunner {
     }
 }
 
-impl Default for PyRunner {
-    /// Creates a new `PythonExecutor` using `new()`.
-    fn default() -> Self {
-        Self::new()
+/// Recursively converts a Python object to a `serde_json::Value`.
+fn py_any_to_json(py: Python, obj: &pyo3::Bound<'_, pyo3::PyAny>) -> PyResult<Value> {
+    if obj.is_none() {
+        return Ok(Value::Null);
+    }
+    if let Ok(b) = obj.cast::<PyBool>() {
+        return Ok(Value::Bool(b.is_true()));
+    }
+    if let Ok(i) = obj.cast::<PyInt>() {
+        return Ok(Value::Number(i.extract::<i64>()?.into()));
+    }
+    if let Ok(f) = obj.cast::<PyFloat>() {
+        // serde_json::Number does not support infinity or NaN
+        let val = f.value();
+        if !val.is_finite() {
+            return Ok(Value::Null);
+        }
+        return Ok(Value::Number(
+            serde_json::Number::from_f64(val).unwrap_or_else(|| serde_json::Number::from(0)),
+        ));
+    }
+    if let Ok(s) = obj.cast::<PyString>() {
+        return Ok(Value::String(s.to_string()));
+    }
+    if let Ok(list) = obj.cast::<PyList>() {
+        let items: PyResult<Vec<Value>> =
+            list.iter().map(|item| py_any_to_json(py, &item)).collect();
+        return Ok(Value::Array(items?));
+    }
+    if let Ok(dict) = obj.cast::<PyDict>() {
+        let mut map = serde_json::Map::new();
+        for (key, value) in dict.iter() {
+            map.insert(key.to_string(), py_any_to_json(py, &value)?);
+        }
+        return Ok(Value::Object(map));
+    }
+
+    // Fallback for other types: convert to string representation
+    Ok(Value::String(obj.to_string()))
+}
+
+/// Converts a serde_json::Value to a Python object.
+fn json_value_to_pyobject(py: Python, value: Value) -> PyResult<pyo3::Py<pyo3::PyAny>> {
+    match value {
+        Value::Null => Ok(py.None()),
+        Value::Bool(b) => b.into_py_any(py),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.into_py_any(py)
+            } else if let Some(u) = n.as_u64() {
+                u.into_py_any(py)
+            } else if let Some(f) = n.as_f64() {
+                f.into_py_any(py)
+            } else {
+                Ok(py.None())
+            }
+        }
+        Value::String(s) => s.into_py_any(py),
+        Value::Array(arr) => {
+            let py_list = pyo3::types::PyList::empty(py);
+            for v in arr {
+                py_list.append(json_value_to_pyobject(py, v)?)?;
+            }
+            Ok(py_list.into())
+        }
+        Value::Object(obj) => {
+            let py_dict = pyo3::types::PyDict::new(py);
+            for (k, v) in obj {
+                py_dict.set_item(k, json_value_to_pyobject(py, v)?)?;
+            }
+            Ok(py_dict.into())
+        }
     }
 }
 
@@ -302,10 +393,7 @@ mod tests {
 
         let result = executor.eval(code).await.unwrap();
 
-        Python::attach(|py| {
-            let z: i32 = result.extract(py).unwrap();
-            assert_eq!(z, 30);
-        });
+        assert_eq!(result, Value::Number(30.into()));
     }
 
     #[tokio::test]
@@ -318,16 +406,11 @@ z = x + y"#;
 
         let result_module = executor.run(code).await.unwrap();
 
-        Python::attach(|py| {
-            assert!(result_module.is_none(py));
-        });
+        assert_eq!(result_module, Value::Null);
 
         let z_val = executor.read_variable("z").await.unwrap();
 
-        Python::attach(|py| {
-            let z: i32 = z_val.extract(py).unwrap();
-            assert_eq!(z, 30);
-        });
+        assert_eq!(z_val, Value::Number(30.into()));
     }
 
     #[tokio::test]
@@ -339,18 +422,11 @@ def add(a, b):
 "#;
 
         executor.run(code).await.unwrap();
-
-        let args = Python::attach(|py| {
-            vec![
-                5i32.into_pyobject(py).unwrap().into(),
-                9i32.into_pyobject(py).unwrap().into(),
-            ]
-        });
-
-        let result = executor.call_function("add", args).await.unwrap();
-        Python::attach(|py| {
-            let _result: i32 = result.extract(py).unwrap();
-        });
+        let result = executor
+            .call_function("add", vec![5.into(), 9.into()])
+            .await
+            .unwrap();
+        assert_eq!(result, Value::Number(14.into()));
     }
 
     #[tokio::test]
@@ -371,19 +447,10 @@ def add(a, b):
         assert!(result2.is_ok());
         assert!(res3.is_ok());
 
-        Python::attach(|py| {
-            let res1 = res1.unwrap();
-            assert!(res1.is_none(py));
-
-            let result1_str: String = result1.unwrap().extract(py).unwrap();
-            assert_eq!(result1_str, "task1");
-
-            let result2_str: String = result2.unwrap().extract(py).unwrap();
-            assert_eq!(result2_str, "task2");
-
-            let result3: String = res3.unwrap().extract(py).unwrap();
-            assert_eq!(result3, "task3");
-        });
+        assert_eq!(res1.unwrap(), Value::Null);
+        assert_eq!(result1.unwrap(), Value::String("task1".to_string()));
+        assert_eq!(result2.unwrap(), Value::String("task2".to_string()));
+        assert_eq!(res3.unwrap(), Value::String("task3".to_string()));
     }
 
     #[tokio::test]
@@ -402,5 +469,40 @@ def add(a, b):
             }
             _ => panic!("Expected a PyError"),
         }
+    }
+    #[tokio::test]
+    async fn test_sample_readme() {
+        let runner = PyRunner::new();
+
+        let code = r#"
+counter = 0
+def greet(name):
+    global counter
+    counter = counter + 1
+    s = "" if counter < 2 else "s"
+    return f"Hello {name}! Called {counter} time{s} from Python."
+"#;
+        // Python function "greet" and variable "counter" is added to globals
+        runner.run(code).await.unwrap();
+
+        // Calling code
+        let result1 = runner
+            .call_function("greet", vec!["World".into()])
+            .await
+            .unwrap();
+        println!("{}", result1.as_str().unwrap()); // Prints: Hello World! Called 1 time from Python.
+        assert_eq!(
+            result1.as_str().unwrap(),
+            "Hello World! Called 1 time from Python."
+        );
+
+        let result2 = runner
+            .call_function("greet", vec!["World".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            result2.as_str().unwrap(),
+            "Hello World! Called 2 times from Python."
+        );
     }
 }

@@ -37,16 +37,17 @@ async fn main() {
 counter = 0
 def greet(name):
     global counter
-    counter = counter + 1s = "" if counter < 2 else "s"
+    counter = counter + 1
+    s = "" if counter < 2 else "s"
     return f"Hello {name}! Called {counter} time{s} from Python."
 "#;
     // Python function "greet" and variable "counter" is added to globals
-    runner.run(code).await?;
+    runner.run(code).await.unwrap();
 
     // Calling code
-    let result1: String = runner.call_function("greet", vec!["World"]).await?;
-    println!("{}", result1); // Prints: Hello World! Called 1 time from Python.
-    let result2: String = runner.call_function("greet", vec!["World"]).await?;
-    println!("{}", result2); // Prints: Hello World! Called 2 times from Python.
+    let result1 = runner.call_function("greet", vec!["World".into()]).await.unwrap();
+    println!("{}", result1.as_str().unwrap()); // Prints: Hello World! Called 1 time from Python.
+    let result2 = runner.call_function("greet", vec!["World".into()]).await.unwrap();
+    println!("{}", result2.as_str().unwrap()); // Prints: Hello World! Called 2 times from Python.
 }
 ```
