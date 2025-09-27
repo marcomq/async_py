@@ -1,0 +1,44 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test ${{ matrix.feature }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        feature: [pyo3]
+        # feature: [pyo3, rustpython]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      if: matrix.feature == 'pyo3'
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Rust toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+
+    - name: Cache cargo dependencies
+      uses: Swatinem/rust-cache@v2
+
+    - name: Run tests (pyo3)
+      if: matrix.feature == 'pyo3'
+      run: cargo test --verbose --features pyo3
+
+    - name: Run tests (rustpython)
+      if: matrix.feature == 'rustpython'
+      run: cargo test --verbose --no-default-features --features rustpython
