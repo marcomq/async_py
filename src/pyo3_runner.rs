@@ -3,7 +3,7 @@
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/async_py
 
-use crate::{CmdType, PyCommand};
+use crate::{print_path_for_python, CmdType, PyCommand};
 use pyo3::{
     exceptions::PyKeyError,
     prelude::*,
@@ -30,6 +30,9 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
                     let c_code = CString::new(code).expect("CString::new failed");
                     py.eval(&c_code, Some(&globals), None)
                         .and_then(|obj| py_any_to_json(py, &obj))
+                }
+                CmdType::RunFile(file) => {
+                    handle_run_file(py, &globals, file)
                 }
                 CmdType::ReadVariable(var_name) => {
                     get_py_object(&globals, &var_name).and_then(|obj| py_any_to_json(py, &obj))
@@ -69,6 +72,25 @@ fn get_py_object<'py>(
     }
 
     Ok(obj)
+}
+
+fn handle_run_file(
+    py: Python,
+    globals: &pyo3::Bound<'_, PyDict>,
+    file: std::path::PathBuf,
+) -> PyResult<Value> {
+        let code = format!(
+        r#"
+import sys
+sys.path.insert(0, {})
+with open({}, 'r') as f:
+    exec(f.read())
+"#,
+        print_path_for_python(&file.parent().unwrap().to_path_buf()),
+        print_path_for_python(&file.to_path_buf())
+    );
+    let c_code = CString::new(code).expect("CString::new failed");
+    py.run(&c_code, Some(&globals), None).map(|_| Value::Null)
 }
 
 /// Handles the `CallFunction` command.

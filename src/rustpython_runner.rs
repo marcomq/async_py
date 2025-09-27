@@ -31,6 +31,9 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
                     .map(|_| Value::Null),
                 CmdType::EvalCode(code) => eval::eval(vm, code, scope.clone(), "<string, eval>")
                     .and_then(|obj| py_to_json(vm, &obj)),
+                CmdType::RunFile(file) => {
+                    handle_run_file(vm, scope.clone(), file).map(|_| Value::Null)
+                }
                 CmdType::ReadVariable(var_name) => {
                     read_variable(vm, scope.clone(), var_name).and_then(|obj| py_to_json(vm, &obj))
                 }
@@ -50,6 +53,16 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
             let _ = cmd.responder.send(response);
         }
     });
+}
+
+fn handle_run_file(
+    vm: &VirtualMachine,
+    scope: Scope,
+    file: &std::path::PathBuf,
+) -> PyResult<()> {
+    let dir = file.parent().unwrap().to_str().unwrap();
+    vm.insert_sys_path(vm.new_pyobj(dir))?;
+    vm.run_script(scope, file.to_str().unwrap())
 }
 
 fn read_variable(vm: &VirtualMachine, scope: Scope, var_name: &str) -> PyResult<PyObjectRef> {
