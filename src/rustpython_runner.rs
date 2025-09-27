@@ -5,7 +5,11 @@
 
 use crate::{CmdType, PyCommand};
 use rustpython_vm::{
-    builtins::{PyBaseException, PyBool, PyDict, PyFloat, PyInt, PyList, PyStr}, convert::ToPyObject, eval, scope::Scope, AsObject, Interpreter, PyObjectRef, PyRef, PyResult, Settings, VirtualMachine
+    builtins::{PyBaseException, PyBool, PyDict, PyFloat, PyInt, PyList, PyStr},
+    convert::ToPyObject,
+    eval,
+    scope::Scope,
+    AsObject, Interpreter, PyObjectRef, PyRef, PyResult, Settings, VirtualMachine,
 };
 use serde_json::{json, Map, Number, Value};
 use tokio::sync::mpsc;
@@ -23,11 +27,10 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
         while let Some(cmd) = receiver.blocking_recv() {
             let result = match &cmd.cmd_type {
                 CmdType::RunCode(code) => vm
-                    .run_code_string(scope.clone(), code, "<stdin>".to_owned())
+                    .run_code_string(scope.clone(), code, "<string, run>".to_owned())
                     .map(|_| Value::Null),
-                CmdType::EvalCode(code) => {
-                    eval::eval(vm, code, scope.clone(), "<stdin>").and_then(|obj| py_to_json(vm, &obj))
-                }
+                CmdType::EvalCode(code) => eval::eval(vm, code, scope.clone(), "<string, eval>")
+                    .and_then(|obj| py_to_json(vm, &obj)),
                 CmdType::ReadVariable(var_name) => {
                     read_variable(vm, scope.clone(), var_name).and_then(|obj| py_to_json(vm, &obj))
                 }
@@ -37,7 +40,13 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
                 }
                 CmdType::Stop => break,
             };
-            let response = result.map_err(|err| format!("Cannot apply cmd {:?}: {}", cmd.cmd_type, print_err_msg(err)));
+            let response = result.map_err(|err| {
+                format!(
+                    "Cannot apply cmd {:?}: {}",
+                    cmd.cmd_type,
+                    print_err_msg(err)
+                )
+            });
             let _ = cmd.responder.send(response);
         }
     });
@@ -103,10 +112,13 @@ fn py_to_json(vm: &VirtualMachine, obj: &PyObjectRef) -> PyResult<Value> {
         return match i.try_to_primitive::<i64>(vm) {
             Ok(n) => Ok(Value::Number(n.into())),
             Err(_) => {
-                let f = i.to_string().parse::<f32>().map_err(|_| vm.new_type_error("number cannot be converted".to_owned()))?;
+                let f = i
+                    .to_string()
+                    .parse::<f32>()
+                    .map_err(|_| vm.new_type_error("number cannot be converted".to_owned()))?;
                 Ok(json!(f))
-            },
-        }
+            }
+        };
     }
     if let Some(f) = obj.downcast_ref::<PyFloat>() {
         return Ok(Value::Number(

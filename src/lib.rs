@@ -131,18 +131,15 @@ impl PyRunner {
     /// * `file`: Absolute path to a python file to execute.
     /// Also loads the path of the file to sys.path for imports.
     pub async fn run_file(&self, file: &Path) -> Result<(), PyRunnerError> {
-        let file_path = cleanup_path_for_python(&file.to_path_buf());
-        let folder_path = cleanup_path_for_python(&file.parent().unwrap().to_path_buf());
-        let code = format!(
+        let sys_import = format!(
             r#"
 import sys
-sys.path.insert(0, {})
-with open({}, 'r') as f:
-    exec(f.read())
+sys.path = sys.path + [{}]
 "#,
-            print_path_for_python(&folder_path.into()),
-            print_path_for_python(&file_path.into())
+            print_path_for_python(&file.parent().unwrap().to_path_buf()),
         );
+        self.run(&sys_import).await?;
+        let code = tokio::fs::read_to_string(file).await.map_err(|e| PyRunnerError::PyError(e.to_string()))?;
         self.run(&code).await
     }
 

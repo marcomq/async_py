@@ -11,8 +11,8 @@ thiserror = "2.0"
 tokio = { version = "1.36.0", features = ["sync", "macros"] }
 
 [features]
-# default = ["rustpython"]
-default = ["pyo3"]
+default = ["rustpython"]
+# default = ["pyo3"]
 pyo3 = ["dep:pyo3"]
 rustpython = ["dep:rustpython-vm", "dep:rustpython-stdlib"]
 
