@@ -1,14 +1,22 @@
+//  Async Python
+//  © Copyright 2025, by Marco Mengelkoch
+//  Licensed under MIT License, see License file for more details
+//  git clone https://github.com/marcomq/tauri-plugin-python
+
 //! A library for calling Python code asynchronously from Rust.
 
 use pyo3::{
     exceptions::PyKeyError,
-    ffi::c_str,
     prelude::*,
     types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString},
     IntoPyObjectExt,
 };
 use serde_json::Value;
-use std::{ffi::CString, thread};
+use std::{
+    ffi::CString,
+    path::{Path, PathBuf},
+    thread,
+};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
@@ -75,11 +83,33 @@ fn handle_call_function(
         )));
     }
 
-    let py_args = args.into_iter().map(|v| json_value_to_pyobject(py, v)).collect::<PyResult<Vec<_>>>()?;
+    let py_args = args
+        .into_iter()
+        .map(|v| json_value_to_pyobject(py, v))
+        .collect::<PyResult<Vec<_>>>()?;
     let t_args = pyo3::types::PyTuple::new(py, py_args)?;
     let result = func.call1(t_args)?;
     py_any_to_json(py, &result)
 }
+
+fn cleanup_path_for_python(path: &PathBuf) -> String {
+    dunce::canonicalize(path)
+        .unwrap()
+        .to_string_lossy()
+        .replace("\\", "/")
+}
+
+fn print_path_for_python(path: &PathBuf) -> String {
+    #[cfg(not(target_os = "windows"))]
+    {
+        format!("\"{}\"", cleanup_path_for_python(path))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        format!("r\"{}\"", cleanup_path_for_python(path))
+    }
+}
+
 /// Manages a dedicated thread for executing Python code asynchronously.
 #[derive(Clone)]
 pub struct PyRunner {
@@ -170,16 +200,34 @@ impl PyRunner {
         Ok(result)
     }
 
-
     /// Asynchronously executes a block of Python code.
     ///
     /// * `code`: A string slice containing the Python code to execute.
-    /// Returns `Ok(Value::Null)` on success, or a `PyRunnerError` on failure.
     /// This is equivalent to Python's `exec()` function.
-    pub async fn run(&self, code: &str) -> Result<Value, PyRunnerError> {
-        self.send_command(CmdType::RunCode(code.into())).await
+    pub async fn run(&self, code: &str) -> Result<(), PyRunnerError> {
+        self.send_command(CmdType::RunCode(code.into()))
+            .await
+            .map(|_| ())
     }
-    
+    /// Asynchronously runs a python file.
+    /// * `file`: Absolute path to a python file to execute.
+    /// Also loads the path of the file to sys.path for imports.
+    pub async fn run_file(&self, file: &Path) -> Result<(), PyRunnerError> {
+        let file_path = cleanup_path_for_python(&file.to_path_buf());
+        let folder_path = cleanup_path_for_python(&file.parent().unwrap().to_path_buf());
+        let code = format!(
+            r#"
+import sys
+sys.path.insert(0, {})
+with open({}, 'r') as f:
+    exec(f.read())
+"#,
+            print_path_for_python(&folder_path.into()),
+            print_path_for_python(&file_path.into())
+        );
+        self.run(&code).await
+    }
+
     /// Asynchronously evaluates a single Python expression.
     ///
     /// * `code`: A string slice containing the Python expression to evaluate.
@@ -196,7 +244,8 @@ impl PyRunner {
     ///   to access attributes of objects (e.g., "my_module.my_variable").
     /// Returns the variable's value as a `serde_json::Value` on success.
     pub async fn read_variable(&self, var_name: &str) -> Result<Value, PyRunnerError> {
-        self.send_command(CmdType::ReadVariable(var_name.into())).await
+        self.send_command(CmdType::ReadVariable(var_name.into()))
+            .await
     }
 
     /// Asynchronously calls a Python function in the interpreter's global scope.
@@ -213,7 +262,8 @@ impl PyRunner {
         self.send_command(CmdType::CallFunction {
             name: name.into(),
             args,
-        }).await
+        })
+        .await
     }
 
     /// Stops the Python execution thread gracefully.
@@ -221,6 +271,67 @@ impl PyRunner {
         // We can ignore the `Ok(Value::Null)` result.
         self.send_command(CmdType::Stop).await?;
         Ok(())
+    }
+    /// Set python venv environment folder (does not change interpreter)
+    pub async fn set_venv(&self, venv_path: &Path) -> Result<(), PyRunnerError> {
+        let set_venv_code = r##"
+import sys
+import os
+
+def add_venv_libs_to_syspath(venv_path):
+    """
+    Adds the site-packages folder (and .pth entries) from a virtual environment to sys.path.
+    
+    Args:
+        venv_path (str): Path to the root of the virtual environment.
+    """
+    if not os.path.isdir(venv_path):
+        raise ValueError(f"{venv_path} is not a directory")
+
+    if os.name == "nt":
+        # Windows: venv\Lib\site-packages
+        site_packages = os.path.join(venv_path, "Lib", "site-packages")
+    else:
+        # POSIX: venv/lib/pythonX.Y/site-packages
+        py_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        site_packages = os.path.join(venv_path, "lib", py_version, "site-packages")
+
+    if not os.path.isdir(site_packages):
+        raise RuntimeError(f"Could not find site-packages in {venv_path}")
+
+    # Add site-packages itself
+    if site_packages not in sys.path:
+        sys.path.insert(0, site_packages)
+
+    # Process .pth files inside site-packages
+    for entry in os.listdir(site_packages):
+        if entry.endswith(".pth"):
+            pth_file = os.path.join(site_packages, entry)
+            try:
+                with open(pth_file, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if line.startswith("import "):
+                            # Execute import statements inside .pth files
+                            exec(line, globals(), locals())
+                        else:
+                            # Treat as a path
+                            extra_path = os.path.join(site_packages, line)
+                            if os.path.exists(extra_path) and extra_path not in sys.path:
+                                sys.path.insert(0, extra_path)
+            except Exception as e:
+                print(f"Warning: Could not process {pth_file}: {e}")
+
+    return site_packages
+"##;
+        self.run(&set_venv_code).await?;
+        self.run(&format!(
+            "add_venv_libs_to_syspath({})",
+            print_path_for_python(&venv_path.to_path_buf())
+        ))
+        .await
     }
 }
 
@@ -302,6 +413,8 @@ fn json_value_to_pyobject(py: Python, value: Value) -> PyResult<pyo3::Py<pyo3::P
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self, File};
+    use std::io::Write;
 
     #[tokio::test]
     async fn test_eval_simple_code() {
@@ -323,9 +436,9 @@ x = 10
 y = 20
 z = x + y"#;
 
-        let result_module = executor.run(code).await.unwrap();
+        let result_module = executor.run(code).await;
 
-        assert_eq!(result_module, Value::Null);
+        assert!(result_module.is_ok());
 
         let z_val = executor.read_variable("z").await.unwrap();
 
@@ -366,7 +479,7 @@ def add(a, b):
         assert!(result2.is_ok());
         assert!(res3.is_ok());
 
-        assert_eq!(res1.unwrap(), Value::Null);
+        assert!(res1.is_ok());
         assert_eq!(result1.unwrap(), Value::String("task1".to_string()));
         assert_eq!(result2.unwrap(), Value::String("task2".to_string()));
         assert_eq!(res3.unwrap(), Value::String("task3".to_string()));
@@ -423,5 +536,66 @@ def greet(name):
             result2.as_str().unwrap(),
             "Hello World! Called 2 times from Python."
         );
+    }
+
+    #[tokio::test]
+    async fn test_run_file() {
+        let runner = PyRunner::new();
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // Create a module to be imported
+        let mut module_file = File::create(dir_path.join("mymodule.py")).unwrap();
+        writeln!(module_file, "def my_func(): return 42").unwrap();
+
+        // Create the main script
+        let script_path = dir_path.join("main.py");
+        let mut script_file = File::create(&script_path).unwrap();
+        writeln!(script_file, "import mymodule\nresult = mymodule.my_func()").unwrap();
+
+        runner.run_file(&script_path).await.unwrap();
+
+        let result = runner.read_variable("result").await.unwrap();
+        assert_eq!(result, Value::Number(42.into()));
+    }
+
+    #[tokio::test]
+    async fn test_set_venv() {
+        let runner = PyRunner::new();
+        let venv_dir = tempfile::tempdir().unwrap();
+        let venv_path = venv_dir.path();
+
+        // Get python version to create correct site-packages path
+        let version_str = runner
+            .eval("f'{__import__(\"sys\").version_info.major}.{__import__(\"sys\").version_info.minor}'")
+            .await
+            .unwrap();
+        let py_version = version_str.as_str().unwrap();
+
+        // Create a fake site-packages directory
+        let site_packages = if cfg!(target_os = "windows") {
+            venv_path.join("Lib").join("site-packages")
+        } else {
+            venv_path
+                .join("lib")
+                .join(format!("python{}", py_version))
+                .join("site-packages")
+        };
+        fs::create_dir_all(&site_packages).unwrap();
+
+        // Create a dummy package in site-packages
+        let package_dir = site_packages.join("dummy_package");
+        fs::create_dir(&package_dir).unwrap();
+        let mut init_file = File::create(package_dir.join("__init__.py")).unwrap();
+        writeln!(init_file, "def dummy_func(): return 'hello from venv'").unwrap();
+
+        // Set the venv
+        runner.set_venv(venv_path).await.unwrap();
+
+        // Try to import and use the dummy package
+        runner.run("import dummy_package").await.unwrap();
+        let result = runner.eval("dummy_package.dummy_func()").await.unwrap();
+
+        assert_eq!(result, Value::String("hello from venv".to_string()));
     }
 }
