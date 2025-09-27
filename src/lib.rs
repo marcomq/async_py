@@ -1,26 +1,18 @@
 //  Async Python
 //  © Copyright 2025, by Marco Mengelkoch
 //  Licensed under MIT License, see License file for more details
-//  git clone https://github.com/marcomq/tauri-plugin-python
+//  git clone https://github.com/marcomq/async_py
 
 //! A library for calling Python code asynchronously from Rust.
 
-use pyo3::{
-    exceptions::PyKeyError,
-    prelude::*,
-    types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString},
-    IntoPyObjectExt,
-};
+mod pyo3_runner;
 use serde_json::Value;
-use std::{
-    ffi::CString,
-    path::{Path, PathBuf},
-    thread,
-};
+use std::path::{Path, PathBuf};
+use std::thread;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
-enum CmdType {
+pub(crate) enum CmdType {
     RunCode(String),
     EvalCode(String),
     ReadVariable(String),
@@ -30,9 +22,9 @@ enum CmdType {
 /// Represents a command to be sent to the Python execution thread. It includes the
 /// command to execute and a one-shot channel sender to send the `serde_json::Value`
 /// result back.
-struct PyCommand {
+pub(crate) struct PyCommand {
     cmd_type: CmdType,
-    responder: oneshot::Sender<PyResult<Value>>,
+    responder: oneshot::Sender<Result<Value, String>>,
 }
 
 /// Custom error types for the `PyRunner`.
@@ -44,52 +36,8 @@ pub enum PyRunnerError {
     #[error("Failed to receive result from Python thread. The thread may have panicked.")]
     ReceiveResultFailed,
 
-    #[error("Python execution error: {0}")]
-    PyError(#[from] PyErr),
-}
-
-/// Resolves a potentially dot-separated Python object name from the globals dictionary.
-fn get_py_object<'py>(
-    globals: &pyo3::Bound<'py, PyDict>,
-    name: &str,
-) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
-    let mut parts = name.split('.');
-    let first_part = parts.next().unwrap(); // split always yields at least one item
-
-    let mut obj = globals
-        .get_item(first_part)?
-        .ok_or_else(|| PyErr::new::<PyKeyError, _>(format!("'{}' not found", first_part)))?;
-
-    for part in parts {
-        obj = obj.getattr(part)?;
-    }
-
-    Ok(obj)
-}
-
-/// Handles the `CallFunction` command.
-fn handle_call_function(
-    py: Python,
-    globals: &pyo3::Bound<'_, PyDict>,
-    name: String,
-    args: Vec<Value>,
-) -> PyResult<Value> {
-    let func = get_py_object(globals, &name)?;
-
-    if !func.is_callable() {
-        return Err(PyErr::new::<PyKeyError, _>(format!(
-            "'{}' is not a callable function",
-            name
-        )));
-    }
-
-    let py_args = args
-        .into_iter()
-        .map(|v| json_value_to_pyobject(py, v))
-        .collect::<PyResult<Vec<_>>>()?;
-    let t_args = pyo3::types::PyTuple::new(py, py_args)?;
-    let result = func.call1(t_args)?;
-    py_any_to_json(py, &result)
+    #[error("Python execution error: {0:?}")]
+    PyError(String),
 }
 
 fn cleanup_path_for_python(path: &PathBuf) -> String {
@@ -127,50 +75,12 @@ impl PyRunner {
     /// which can happen if Python is already initialized in an incompatible way.
     pub fn new() -> Self {
         // Create a multi-producer, single-consumer channel for sending commands.
-        let (sender, mut receiver) = mpsc::channel::<PyCommand>(32);
+        let (sender, receiver) = mpsc::channel::<PyCommand>(32);
 
         // Spawn a new OS thread to handle all Python-related work.
         // This is crucial to avoid blocking the async runtime and to manage the GIL correctly.
         thread::spawn(move || {
-            // Prepare the Python interpreter for use in a multi-threaded context.
-            // This must be called before any other pyo3 functions.
-            Python::initialize();
-            // Acquire the GIL and enter a Python context.
-            // The `py.allow_threads` call releases the GIL when we are waiting for commands,
-            // allowing other Python threads (if any) to run.
-            Python::attach(|py| {
-                // Loop indefinitely, waiting for commands from the channel.
-                let globals = PyDict::new(py);
-                while let Some(cmd) = py.detach(|| receiver.blocking_recv()) {
-                    match cmd.cmd_type {
-                        CmdType::RunCode(code) => {
-                            let c_code = CString::new(code).expect("CString::new failed");
-                            let result = py.run(&c_code, Some(&globals), None);
-                            let _ = cmd.responder.send(result.map(|_| Value::Null));
-                        }
-                        CmdType::EvalCode(code) => {
-                            let c_code = CString::new(code).expect("CString::new failed");
-                            let result = py.eval(&c_code, Some(&globals), None);
-                            let _ = cmd
-                                .responder
-                                .send(result.and_then(|obj| py_any_to_json(py, &obj)));
-                        }
-                        CmdType::ReadVariable(var_name) => {
-                            let result = get_py_object(&globals, &var_name)
-                                .and_then(|obj| py_any_to_json(py, &obj));
-                            let _ = cmd.responder.send(result);
-                        }
-                        CmdType::CallFunction { name, args } => {
-                            let result = handle_call_function(py, &globals, name, args);
-                            let _ = cmd.responder.send(result);
-                        }
-                        CmdType::Stop => {
-                            let _ = cmd.responder.send(Ok(Value::Null));
-                            break;
-                        }
-                    };
-                }
-            });
+            pyo3_runner::python_thread_main(receiver);
         });
 
         Self { sender }
@@ -193,11 +103,10 @@ impl PyRunner {
             .map_err(|_| PyRunnerError::SendCommandFailed)?;
 
         // Await the result from the Python thread.
-        let result = receiver
+        receiver
             .await
-            .map_err(|_| PyRunnerError::ReceiveResultFailed)??;
-
-        Ok(result)
+            .map_err(|_| PyRunnerError::ReceiveResultFailed)?
+            .map_err(PyRunnerError::PyError)
     }
 
     /// Asynchronously executes a block of Python code.
@@ -335,81 +244,6 @@ def add_venv_libs_to_syspath(venv_path):
     }
 }
 
-/// Recursively converts a Python object to a `serde_json::Value`.
-fn py_any_to_json(py: Python, obj: &pyo3::Bound<'_, pyo3::PyAny>) -> PyResult<Value> {
-    if obj.is_none() {
-        return Ok(Value::Null);
-    }
-    if let Ok(b) = obj.cast::<PyBool>() {
-        return Ok(Value::Bool(b.is_true()));
-    }
-    if let Ok(i) = obj.cast::<PyInt>() {
-        return Ok(Value::Number(i.extract::<i64>()?.into()));
-    }
-    if let Ok(f) = obj.cast::<PyFloat>() {
-        // serde_json::Number does not support infinity or NaN
-        let val = f.value();
-        if !val.is_finite() {
-            return Ok(Value::Null);
-        }
-        return Ok(Value::Number(
-            serde_json::Number::from_f64(val).unwrap_or_else(|| serde_json::Number::from(0)),
-        ));
-    }
-    if let Ok(s) = obj.cast::<PyString>() {
-        return Ok(Value::String(s.to_string()));
-    }
-    if let Ok(list) = obj.cast::<PyList>() {
-        let items: PyResult<Vec<Value>> =
-            list.iter().map(|item| py_any_to_json(py, &item)).collect();
-        return Ok(Value::Array(items?));
-    }
-    if let Ok(dict) = obj.cast::<PyDict>() {
-        let mut map = serde_json::Map::new();
-        for (key, value) in dict.iter() {
-            map.insert(key.to_string(), py_any_to_json(py, &value)?);
-        }
-        return Ok(Value::Object(map));
-    }
-
-    // Fallback for other types: convert to string representation
-    Ok(Value::String(obj.to_string()))
-}
-
-/// Converts a serde_json::Value to a Python object.
-fn json_value_to_pyobject(py: Python, value: Value) -> PyResult<pyo3::Py<pyo3::PyAny>> {
-    match value {
-        Value::Null => Ok(py.None()),
-        Value::Bool(b) => b.into_py_any(py),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                i.into_py_any(py)
-            } else if let Some(u) = n.as_u64() {
-                u.into_py_any(py)
-            } else if let Some(f) = n.as_f64() {
-                f.into_py_any(py)
-            } else {
-                Ok(py.None())
-            }
-        }
-        Value::String(s) => s.into_py_any(py),
-        Value::Array(arr) => {
-            let py_list = pyo3::types::PyList::empty(py);
-            for v in arr {
-                py_list.append(json_value_to_pyobject(py, v)?)?;
-            }
-            py_list.into_py_any(py)
-        }
-        Value::Object(obj) => {
-            let py_dict = pyo3::types::PyDict::new(py);
-            for (k, v) in obj {
-                py_dict.set_item(k, json_value_to_pyobject(py, v)?)?;
-            }
-            py_dict.into_py_any(py)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,9 +329,7 @@ def add(a, b):
 
         match result {
             Err(PyRunnerError::PyError(py_err)) => {
-                Python::attach(|py| {
-                    assert!(py_err.is_instance_of::<pyo3::exceptions::PyZeroDivisionError>(py));
-                });
+                assert!(py_err.contains("ZeroDivisionError: division by zero"));
             }
             _ => panic!("Expected a PyError"),
         }
