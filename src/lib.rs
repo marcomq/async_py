@@ -53,7 +53,7 @@ fn cleanup_path_for_python(path: &PathBuf) -> String {
         .replace("\\", "/")
 }
 
-fn print_path_for_python(path: &PathBuf) -> String {
+pub fn print_path_for_python(path: &PathBuf) -> String {
     #[cfg(not(target_os = "windows"))]
     {
         format!("\"{}\"", cleanup_path_for_python(path))

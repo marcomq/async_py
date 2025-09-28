@@ -81,7 +81,6 @@ fn call_function(vm: &VirtualMachine, scope: Scope, name: &str, args: Vec<Value>
 
 /// Converts a `serde_json::Value` to a `PyObjectRef`.
 fn json_to_py(vm: &VirtualMachine, val: Value) -> PyObjectRef {
-    dbg!(&val);
     match val {
         Value::Null => vm.ctx.none(),
         Value::Bool(b) => vm.ctx.new_bool(b).to_pyobject(vm),
