@@ -183,62 +183,34 @@ impl PyRunner {
     }
     /// Set python venv environment folder (does not change interpreter)
     pub async fn set_venv(&self, venv_path: &Path) -> Result<(), PyRunnerError> {
-        let set_venv_code = r##"
-import sys
-import os
-
-def add_venv_libs_to_syspath(venv_path):
-    """
-    Adds the site-packages folder (and .pth entries) from a virtual environment to sys.path.
-    
-    Args:
-        venv_path (str): Path to the root of the virtual environment.
-    """
-    if not os.path.isdir(venv_path):
-        raise ValueError(f"{venv_path} is not a directory")
-
-    if os.name == "nt":
-        # Windows: venv\Lib\site-packages
-        site_packages = os.path.join(venv_path, "Lib", "site-packages")
-    else:
-        # POSIX: venv/lib/pythonX.Y/site-packages
-        py_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
-        site_packages = os.path.join(venv_path, "lib", py_version, "site-packages")
-
-    if not os.path.isdir(site_packages):
-        raise RuntimeError(f"Could not find site-packages in {venv_path}")
-
-    # Add site-packages itself
-    if site_packages not in sys.path:
-        sys.path.insert(0, site_packages)
-
-    # Process .pth files inside site-packages
-    for entry in os.listdir(site_packages):
-        if entry.endswith(".pth"):
-            pth_file = os.path.join(site_packages, entry)
-            try:
-                with open(pth_file, "r") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#"):
-                            continue
-                        if line.startswith("import "):
-                            # Execute import statements inside .pth files
-                            exec(line, globals(), locals())
-                        else:
-                            # Treat as a path
-                            extra_path = os.path.join(site_packages, line)
-                            if os.path.exists(extra_path) and extra_path not in sys.path:
-                                sys.path.insert(0, extra_path)
-            except Exception as e:
-                print(f"Warning: Could not process {pth_file}: {e}")
-
-    return site_packages
-"##;
+        if !venv_path.is_dir() {
+            return Err(PyRunnerError::PyError(format!(
+                "Could not find venv directory {}",
+                venv_path.display()
+            )));
+        }
+        let set_venv_code = include_str!("set_venv.py");
         self.run(&set_venv_code).await?;
+
+        let site_packages = if cfg!(target_os = "windows") {
+            venv_path.join("Lib").join("site-packages")
+        } else {
+            let version_code = "f\"python{sys.version_info.major}.{sys.version_info.minor}\"";
+            let py_version = self.eval(version_code).await?;
+            venv_path
+                .join("lib")
+                .join(py_version.as_str().unwrap())
+                .join("site-packages")
+        };
+        #[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
+        let with_pth = "True";
+        #[cfg(feature = "rustpython")]
+        let with_pth = "False";
+
         self.run(&format!(
-            "add_venv_libs_to_syspath({})",
-            print_path_for_python(&venv_path.to_path_buf())
+            "add_venv_libs_to_syspath({}, {})",
+            print_path_for_python(&site_packages),
+            with_pth
         ))
         .await
     }

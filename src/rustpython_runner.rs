@@ -24,6 +24,12 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
 
     interp.enter(|vm| {
         let scope = vm.new_scope_with_builtins();
+        vm.run_code_string(
+            scope.clone(),
+            "import sys; sys.path.append('./')",
+            "<init>".into(),
+        )
+        .unwrap();
         while let Some(cmd) = receiver.blocking_recv() {
             let result = match &cmd.cmd_type {
                 CmdType::RunCode(code) => vm
@@ -31,9 +37,9 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
                     .map(|_| Value::Null),
                 CmdType::EvalCode(code) => eval::eval(vm, code, scope.clone(), "<string, eval>")
                     .and_then(|obj| py_to_json(vm, &obj)),
-                CmdType::RunFile(file) => {
-                    handle_run_file(vm, scope.clone(), file).map(|_| Value::Null)
-                }
+                CmdType::RunFile(file) => vm
+                    .run_script(scope.clone(), file.to_str().unwrap())
+                    .map(|_| Value::Null),
                 CmdType::ReadVariable(var_name) => {
                     read_variable(vm, scope.clone(), var_name).and_then(|obj| py_to_json(vm, &obj))
                 }
@@ -53,16 +59,6 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
             let _ = cmd.responder.send(response);
         }
     });
-}
-
-fn handle_run_file(
-    vm: &VirtualMachine,
-    scope: Scope,
-    file: &std::path::PathBuf,
-) -> PyResult<()> {
-    let dir = file.parent().unwrap().to_str().unwrap();
-    vm.insert_sys_path(vm.new_pyobj(dir))?;
-    vm.run_script(scope, file.to_str().unwrap())
 }
 
 fn read_variable(vm: &VirtualMachine, scope: Scope, var_name: &str) -> PyResult<PyObjectRef> {
@@ -161,6 +157,7 @@ fn py_to_json(vm: &VirtualMachine, obj: &PyObjectRef) -> PyResult<Value> {
         }
         return Ok(Value::Object(map));
     }
+    // fallback for types that can convert to primitives
     if let Some(b) = obj.clone().try_into_value::<bool>(vm).ok() {
         return Ok(Value::Bool(b));
     }
@@ -174,6 +171,7 @@ fn py_to_json(vm: &VirtualMachine, obj: &PyObjectRef) -> PyResult<Value> {
     }
 
     // Fallback for other types
+
     let fallback = obj.str(vm)?;
     Ok(Value::String(fallback.to_string()))
 }

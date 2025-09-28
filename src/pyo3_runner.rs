@@ -31,9 +31,7 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
                     py.eval(&c_code, Some(&globals), None)
                         .and_then(|obj| py_any_to_json(py, &obj))
                 }
-                CmdType::RunFile(file) => {
-                    handle_run_file(py, &globals, file)
-                }
+                CmdType::RunFile(file) => handle_run_file(py, &globals, file),
                 CmdType::ReadVariable(var_name) => {
                     get_py_object(&globals, &var_name).and_then(|obj| py_any_to_json(py, &obj))
                 }
@@ -79,7 +77,7 @@ fn handle_run_file(
     globals: &pyo3::Bound<'_, PyDict>,
     file: std::path::PathBuf,
 ) -> PyResult<Value> {
-        let code = format!(
+    let code = format!(
         r#"
 import sys
 sys.path.insert(0, {})
