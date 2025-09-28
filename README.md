@@ -19,7 +19,7 @@ Add `async_py` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-async_py = { git = "https://github.com/marcomq/async_py" } # Or path, or crates.io version
+async_py = "0.2.0"
 tokio = { version = "1", features = ["full"] }
 ```
 

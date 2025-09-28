@@ -1,7 +1,13 @@
 [package]
 name = "async_py"
 version = "0.2.0"
+description = "A Rust library for calling Python code asynchronously using pyo3 or rustpython."
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/marcomq/async_py"
+readme = "README.md"
+keywords = ["python", "async", "pyo3", "rustpython", "ffi"]
+categories = ["api-bindings", "asynchronous", "external-ffi-bindings"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
@@ -36,5 +42,3 @@ features = ["threading"]
 [dev-dependencies.tokio]
 version = "1"
 features = ["full"]
-
-
