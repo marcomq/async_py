@@ -23,6 +23,7 @@ pub(crate) enum CmdType {
     EvalCode(String),
     ReadVariable(String),
     CallFunction { name: String, args: Vec<Value> },
+    CallAsyncFunction { name: String, args: Vec<Value> },
     Stop,
 }
 /// Represents a command to be sent to the Python execution thread. It includes the
@@ -163,12 +164,32 @@ impl PyRunner {
     ///   to access functions within modules (e.g., "my_module.my_function").
     /// * `args`: A vector of `serde_json::Value` to pass as arguments to the function.
     /// Returns the function's return value as a `serde_json::Value` on success.
+    /// Does not release GIL during await.
     pub async fn call_function(
         &self,
         name: &str,
         args: Vec<Value>,
     ) -> Result<Value, PyRunnerError> {
         self.send_command(CmdType::CallFunction {
+            name: name.into(),
+            args,
+        })
+        .await
+    }
+
+    /// Asynchronously calls an async Python function in the interpreter's global scope.
+    ///
+    /// * `name`: The name of the function to call. It can be a dot-separated path
+    ///   to access functions within modules (e.g., "my_module.my_function").
+    /// * `args`: A vector of `serde_json::Value` to pass as arguments to the function.
+    /// Returns the function's return value as a `serde_json::Value` on success.
+    /// Will release GIL during await.
+    pub async fn call_async_function(
+        &self,
+        name: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, PyRunnerError> {
+        self.send_command(CmdType::CallAsyncFunction {
             name: name.into(),
             args,
         })
@@ -265,6 +286,26 @@ def add(a, b):
             .await
             .unwrap();
         assert_eq!(result, Value::Number(14.into()));
+    }
+
+    #[cfg(feature = "pyo3")]
+    #[tokio::test]
+    async fn test_run_with_async_function() {
+        let executor = PyRunner::new();
+        let code = r#"
+import asyncio
+
+async def async_add(a, b):
+    await asyncio.sleep(0.1)
+    return a + b
+"#;
+
+        executor.run(code).await.unwrap();
+        let result = executor
+            .call_async_function("async_add", vec![5.into(), 10.into()])
+            .await
+            .unwrap();
+        assert_eq!(result, Value::Number(15.into()));
     }
 
     #[tokio::test]

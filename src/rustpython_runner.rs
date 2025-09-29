@@ -47,6 +47,9 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
                     call_function(vm, scope.clone(), name, args.clone())
                         .and_then(|obj| py_to_json(vm, &obj))
                 }
+                CmdType::CallAsyncFunction { name, args } => {
+                    unimplemented!("Async functions are not supported yet in RustPython")
+                }
                 CmdType::Stop => break,
             };
             let response = result.map_err(|err| {

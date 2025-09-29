@@ -19,12 +19,18 @@ tokio = { version = "1.36.0", features = ["sync", "macros"] }
 [features]
 default = ["pyo3"]
 # default = ["rustpython"]
-pyo3 = ["dep:pyo3"]
+pyo3 = ["dep:pyo3", "dep:pyo3-async-runtimes"]
 rustpython = ["dep:rustpython-vm", "dep:rustpython-stdlib"]
 
 [dependencies.pyo3]
 version = "0.26.0"
 features = ["auto-initialize"]
+optional = true
+
+
+[dependencies.pyo3-async-runtimes]
+version = "0.26"
+features = ["attributes", "async-std-runtime"]
 optional = true
 
 [dev-dependencies]
