@@ -30,7 +30,7 @@ optional = true
 
 [dependencies.pyo3-async-runtimes]
 version = "0.26"
-features = ["attributes", "async-std-runtime"]
+features = ["attributes", "tokio-runtime"]
 optional = true
 
 [dev-dependencies]

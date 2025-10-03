@@ -10,10 +10,12 @@ use pyo3::{
     types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString},
     IntoPyObjectExt,
 };
+use pyo3_async_runtimes::tokio::{into_future, run_until_complete};
 use serde_json::Value;
-use std::{ffi::CString, future::Future};
+use core::panic;
+use std::{ffi::CString, future::Future, vec};
 use tokio::{
-    runtime::Runtime,
+    runtime::{Builder, Runtime},
     sync::{mpsc, oneshot},
 };
 
@@ -30,15 +32,12 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
         asyncio
             .call_method1("set_event_loop", (event_loop.clone(),))
             .expect("Failed to set event loop");
-        let locals = pyo3_async_runtimes::TaskLocals::new(event_loop.clone())
-            .copy_context(py)
-            .unwrap();
         let globals = PyDict::new(py);
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("Failed to create Tokio runtime for async Python execution");
-        let rt_future = rt.spawn(async {});
+
         while let Some(mut cmd) = py.detach(|| receiver.blocking_recv()) {
             let result = match std::mem::replace(&mut cmd.cmd_type, CmdType::Stop) {
                 CmdType::RunCode(code) => {
@@ -58,16 +57,23 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
                     handle_call_function(py, &globals, name, args)
                 }
                 CmdType::CallAsyncFunction { name, args } => {
-                    let locals = locals.clone_ref(py);
-                    handle_call_async_function(
-                        py,
-                        &globals,
-                        name,
-                        args,
-                        cmd.responder,
-                        &rt,
-                        locals,
-                    );
+                    let func = get_py_object(&globals, &name).unwrap(); // TODO;
+                    check_func_callable(&func, &name).unwrap(); // TODO
+                    let event_loop = event_loop.clone().unbind();
+                    let func = func.unbind();
+                    py.detach(|| rt.spawn(async move {
+                        let result = handle_call_async_function(
+                            func,
+                            args,
+                            event_loop,
+                        ).await;
+                        let response = match result {
+                            Ok(value) => Ok(value),
+                            Err(e) => Err(e.to_string()),
+                        };
+                        let _ = cmd.responder.send(response);
+                    }));
+
                     continue;
                 }
                 CmdType::Stop => break,
@@ -80,7 +86,6 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
             };
             let _ = cmd.responder.send(response);
         }
-        rt_future.abort(); // Cleanly stop the asyncio event loop before the thread exits.
         event_loop
             .call_method0("stop")
             .expect("Failed to stop event loop");
@@ -93,7 +98,7 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
 fn get_py_object<'py>(
     globals: &pyo3::Bound<'py, PyDict>,
     name: &str,
-) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+) -> PyResult<pyo3::Bound<'py, PyAny>> {
     let mut parts = name.split('.');
     let first_part = parts.next().unwrap(); // split always yields at least one item
 
@@ -106,6 +111,17 @@ fn get_py_object<'py>(
     }
 
     Ok(obj)
+}
+
+fn check_func_callable(func: &Bound<PyAny>, name: &str) -> PyResult<()> {
+    if !func.is_callable() {
+        Err(PyErr::new::<PyKeyError, _>(format!(
+            "'{}' is not a callable function",
+            name
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 fn handle_run_file(
@@ -135,80 +151,46 @@ fn handle_call_function(
     args: Vec<Value>,
 ) -> PyResult<Value> {
     let func = get_py_object(globals, &name)?;
-
-    if !func.is_callable() {
-        return Err(PyErr::new::<PyKeyError, _>(format!(
-            "'{}' is not a callable function",
-            name
-        )));
-    }
-
-    let py_args = args
-        .into_iter()
-        .map(|v| json_value_to_pyobject(py, v))
-        .collect::<PyResult<Vec<_>>>()?;
-    let t_args = pyo3::types::PyTuple::new(py, py_args)?;
+    check_func_callable(&func, &name)?;
+    let t_args = vec_to_py_tuple(&py, args)?;
     let result = func.call1(t_args)?;
     py_any_to_json(py, &result)
 }
 
-fn handle_call_async_pre_await(
-    py: &Python,
-    globals: &pyo3::Bound<'_, PyDict>,
-    name: String,
+fn vec_to_py_tuple<'py>(
+    py: &Python<'py>,
     args: Vec<Value>,
-    locals: pyo3_async_runtimes::TaskLocals,
-) -> PyResult<impl Future<Output = PyResult<Py<PyAny>>> + Send> {
-    let func = get_py_object(globals, &name)?;
-
-    if !func.is_callable() {
-        return Err(PyErr::new::<PyKeyError, _>(format!(
-            "'{}' is not a callable function",
-            name
-        )));
-    }
-
+) -> PyResult<Bound<'py, pyo3::types::PyTuple>> {
     let py_args = args
         .into_iter()
         .map(|v| json_value_to_pyobject(*py, v))
         .collect::<PyResult<Vec<_>>>()?;
-    let t_args = pyo3::types::PyTuple::new(*py, py_args)?;
-    let result = func.call1(t_args)?;
-    pyo3_async_runtimes::into_future_with_locals(&locals, result)
+    pyo3::types::PyTuple::new(*py, py_args)
 }
 
 /// Handles the `CallAsyncFunction` command.
-fn handle_call_async_function(
-    py: Python,
-    globals: &pyo3::Bound<PyDict>,
-    name: String,
+async fn handle_call_async_function(
+    func: Py<PyAny>,       
     args: Vec<Value>,
-    responder: oneshot::Sender<Result<Value, String>>,
-    rt: &Runtime,
-    locals: pyo3_async_runtimes::TaskLocals,
-) {
-    let result_future = match handle_call_async_pre_await(&py, globals, name, args, locals) {
-        Ok(fut) => fut,
-        Err(e) => {
-            let _ = responder.send(Err(e.to_string()));
-            return;
-        }
-    };
-    rt.spawn(async move {
-        let result = result_future
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|py_res| {
-                Python::attach(|py| {
-                    py_any_to_json(py, &py_res.into_bound(py)).map_err(|e| e.to_string())
-                })
-            });
-        let _ = responder.send(result);
-    });
+    event_loop: Py<PyAny>,
+) -> PyResult<Value> {
+    panic!("debug");
+    Python::attach(|py| {
+        let func = func.bind(py);
+        let event_loop = event_loop.bind(py).clone();
+        let t_args = vec_to_py_tuple(&py, args)?;
+        let result = func.call1(t_args)?;
+        dbg!(1);
+        let result_future = into_future(result)?;   
+        dbg!(2); 
+        let result = run_until_complete(event_loop, async move {result_future.await})?;
+        dbg!(3);
+        py_any_to_json(py, &result.into_bound(py))
+    })
 }
 
 /// Recursively converts a Python object to a `serde_json::Value`.
-fn py_any_to_json(py: Python, obj: &pyo3::Bound<'_, pyo3::PyAny>) -> PyResult<Value> {
+fn py_any_to_json(py: Python, obj: &pyo3::Bound<'_, PyAny>) -> PyResult<Value> {
     if obj.is_none() {
         return Ok(Value::Null);
     }
@@ -249,7 +231,7 @@ fn py_any_to_json(py: Python, obj: &pyo3::Bound<'_, pyo3::PyAny>) -> PyResult<Va
 }
 
 /// Converts a serde_json::Value to a Python object.
-fn json_value_to_pyobject(py: Python, value: Value) -> PyResult<pyo3::Py<pyo3::PyAny>> {
+fn json_value_to_pyobject(py: Python, value: Value) -> PyResult<pyo3::Py<PyAny>> {
     match value {
         Value::Null => Ok(py.None()),
         Value::Bool(b) => b.into_py_any(py),
