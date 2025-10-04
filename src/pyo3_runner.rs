@@ -10,35 +10,18 @@ use pyo3::{
     types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString},
     IntoPyObjectExt,
 };
-use pyo3_async_runtimes::tokio::{into_future, run_until_complete};
 use serde_json::Value;
-use core::panic;
-use std::{ffi::CString, future::Future, vec};
-use tokio::{
-    runtime::{Builder, Runtime},
-    sync::{mpsc, oneshot},
-};
+use std::ffi::CString;
+use tokio::sync::{mpsc, oneshot};
 
 /// The main loop for the Python thread. This function is spawned in a new
 /// thread and is responsible for all Python interaction.
-pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
+pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
     Python::initialize();
-    Python::attach(|py| {
-        // Setup and run the asyncio event loop for the current thread.
-        let asyncio = py.import("asyncio").expect("Failed to import asyncio");
-        let event_loop = asyncio
-            .call_method0("new_event_loop")
-            .expect("Failed to create new event loop");
-        asyncio
-            .call_method1("set_event_loop", (event_loop.clone(),))
-            .expect("Failed to set event loop");
-        let globals = PyDict::new(py);
-        let rt = Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create Tokio runtime for async Python execution");
-
-        while let Some(mut cmd) = py.detach(|| receiver.blocking_recv()) {
+    let globals = Python::attach(|py| PyDict::new(py).unbind());
+    while let Some(mut cmd) = receiver.recv().await {
+        Python::attach(|py| {
+            let globals = globals.bind(py);
             let result = match std::mem::replace(&mut cmd.cmd_type, CmdType::Stop) {
                 CmdType::RunCode(code) => {
                     let c_code = CString::new(code).expect("CString::new failed");
@@ -59,24 +42,14 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
                 CmdType::CallAsyncFunction { name, args } => {
                     let func = get_py_object(&globals, &name).unwrap(); // TODO;
                     check_func_callable(&func, &name).unwrap(); // TODO
-                    let event_loop = event_loop.clone().unbind();
                     let func = func.unbind();
-                    py.detach(|| rt.spawn(async move {
-                        let result = handle_call_async_function(
-                            func,
-                            args,
-                            event_loop,
-                        ).await;
-                        let response = match result {
-                            Ok(value) => Ok(value),
-                            Err(e) => Err(e.to_string()),
-                        };
-                        let _ = cmd.responder.send(response);
-                    }));
 
-                    continue;
+                    py.detach(|| {
+                        tokio::spawn(handle_call_async_function(func, args, cmd.responder))
+                    });
+                    return; // The response is sent async, so we can return early.
                 }
-                CmdType::Stop => break,
+                CmdType::Stop => return receiver.close(),
             };
 
             // Convert PyErr to a string representation to avoid exposing it outside this module.
@@ -85,13 +58,10 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
                 Err(e) => Err(e.to_string()),
             };
             let _ = cmd.responder.send(response);
-        }
-        event_loop
-            .call_method0("stop")
-            .expect("Failed to stop event loop");
+        });
         // After the loop, we can send a final confirmation for the Stop command if needed,
         // but the current implementation in lib.rs handles the channel closing.
-    });
+    }
 }
 
 /// Resolves a potentially dot-separated Python object name from the globals dictionary.
@@ -170,23 +140,24 @@ fn vec_to_py_tuple<'py>(
 
 /// Handles the `CallAsyncFunction` command.
 async fn handle_call_async_function(
-    func: Py<PyAny>,       
+    func: Py<PyAny>,
     args: Vec<Value>,
-    event_loop: Py<PyAny>,
-) -> PyResult<Value> {
-    panic!("debug");
-    Python::attach(|py| {
+    responder: oneshot::Sender<Result<Value, String>>,
+) {
+    let result = Python::attach(|py| {
         let func = func.bind(py);
-        let event_loop = event_loop.bind(py).clone();
         let t_args = vec_to_py_tuple(&py, args)?;
-        let result = func.call1(t_args)?;
-        dbg!(1);
-        let result_future = into_future(result)?;   
-        dbg!(2); 
-        let result = run_until_complete(event_loop, async move {result_future.await})?;
-        dbg!(3);
-        py_any_to_json(py, &result.into_bound(py))
-    })
+        let coroutine = func.call1(t_args)?;
+
+        let asyncio = py.import("asyncio")?;
+        let loop_obj = asyncio.call_method0("new_event_loop")?;
+        asyncio.call_method1("set_event_loop", (loop_obj.clone(),))?;
+        let result = loop_obj.call_method1("run_until_complete", (coroutine,))?;
+        loop_obj.call_method0("close")?;
+
+        py_any_to_json(py, &result)
+    });
+    let _ = responder.send(result.map_err(|e| e.to_string()));
 }
 
 /// Recursively converts a Python object to a `serde_json::Value`.

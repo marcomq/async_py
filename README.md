@@ -50,6 +50,44 @@ def greet(name):
     println!("{}", result2.as_str().unwrap()); // Prints: Hello World! Called 2 times from Python.
 }
 ```
+
+### Async Python Example
+
+```rust
+use async_py::PyRunner;
+
+#[tokio::main]
+async fn main() {
+    let runner = PyRunner::new();
+    let code = r#"
+import asyncio
+counter = 0
+
+async def add_and_sleep(a, b, sleep_time):
+    global counter
+    await asyncio.sleep(sleep_time)
+    counter += 1
+    return a + b + counter
+"#;
+
+    runner.run(code).await.unwrap();
+    let result1 = runner.call_async_function("add_and_sleep", vec![5.into(), 10.into(), 1.into()]);
+    let result2 = runner.call_async_function("add_and_sleep", vec![5.into(), 10.into(), 0.1.into()]);
+    let (result1, result2) = tokio::join!(result1, result2);
+    assert_eq!(result1.unwrap(), Value::Number(17.into()));
+    assert_eq!(result2.unwrap(), Value::Number(16.into()));
+}
+```
+Both function calls are triggered to run async code at the same time. While the first call waits for the sleep,
+the second can already start and also increment the counter first. Therefore,
+result1 will wait longer and compute 5 + 10 + 2, while the result2 can compute 5 + 10 + 1.
+
+Each call will use its own event loop. This may not be very efficient and changed later.
+
+Make sure to use `call_async_function` for async python functions. Using `call_function` will
+probably raise an error. 
+`call_async_function` is not available for RustPython.
+
 ### Using a venv
 It is generally recommended to use a venv to install pip packages.
 While you cannot switch the interpreter version with this crate, you can use an

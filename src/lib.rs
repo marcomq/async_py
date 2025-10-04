@@ -88,7 +88,11 @@ impl PyRunner {
         // This is crucial to avoid blocking the async runtime and to manage the GIL correctly.
         thread::spawn(move || {
             #[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
-            pyo3_runner::python_thread_main(receiver);
+            {
+                use tokio::runtime::Builder;
+                let rt = Builder::new_multi_thread().enable_all().build().unwrap();
+                rt.block_on(pyo3_runner::python_thread_main(receiver));
+            }
 
             #[cfg(feature = "rustpython")]
             rustpython_runner::python_thread_main(receiver);
@@ -294,18 +298,21 @@ def add(a, b):
         let executor = PyRunner::new();
         let code = r#"
 import asyncio
+counter = 0
 
-async def async_add(a, b):
-    await asyncio.sleep(0.1)
-    return a + b
+async def add_and_sleep(a, b, sleep_time):
+    global counter
+    await asyncio.sleep(sleep_time)
+    counter += 1
+    return a + b + counter
 "#;
 
         executor.run(code).await.unwrap();
-        let result = executor
-            .call_async_function("async_add", vec![5.into(), 10.into()])
-            .await
-            .unwrap();
-        assert_eq!(result, Value::Number(15.into()));
+        let result1 = executor.call_async_function("add_and_sleep", vec![5.into(), 10.into(), 1.into()]);
+        let result2 = executor.call_async_function("add_and_sleep", vec![5.into(), 10.into(), 0.1.into()]);
+        let (result1, result2) = tokio::join!(result1, result2);
+        assert_eq!(result1.unwrap(), Value::Number(17.into()));
+        assert_eq!(result2.unwrap(), Value::Number(16.into()));
     }
 
     #[tokio::test]
