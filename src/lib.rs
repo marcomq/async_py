@@ -278,6 +278,8 @@ z = x + y"#;
 
     #[tokio::test]
     async fn test_run_with_function() {
+        // cargo test tests::test_run_with_function --release -- --nocapture
+        let start_time = std::time::Instant::now();
         let executor = PyRunner::new();
         let code = r#"
 def add(a, b):
@@ -290,6 +292,8 @@ def add(a, b):
             .await
             .unwrap();
         assert_eq!(result, Value::Number(14.into()));
+        let duration = start_time.elapsed();
+        println!("test_run_with_function took: {} microseconds", duration.as_micros());
     }
 
     #[cfg(feature = "pyo3")]
