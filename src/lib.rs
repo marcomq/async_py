@@ -10,11 +10,18 @@ mod pyo3_runner;
 #[cfg(feature = "rustpython")]
 mod rustpython_runner;
 
+use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::thread;
 use thiserror::Error;
+use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
+
+/// A lazily-initialized global Tokio runtime for synchronous functions.
+static SYNC_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+    Runtime::new().expect("Failed to create a new Tokio runtime for sync functions")
+});
 
 #[derive(Debug)]
 pub(crate) enum CmdType {
@@ -143,9 +150,7 @@ impl PyRunner {
     ///
     /// **Note:** Calling this from an existing async runtime can lead to panics.
     pub fn run_sync(&self, code: &str) -> Result<(), PyRunnerError> {
-        let rt =
-            tokio::runtime::Runtime::new().map_err(|e| PyRunnerError::PyError(e.to_string()))?;
-        rt.block_on(self.run(code))
+        SYNC_RUNTIME.block_on(self.run(code))
     }
 
     /// Asynchronously runs a python file.
@@ -166,9 +171,7 @@ impl PyRunner {
     ///
     /// **Note:** Calling this from an existing async runtime can lead to panics.
     pub fn run_file_sync(&self, file: &Path) -> Result<(), PyRunnerError> {
-        let rt =
-            tokio::runtime::Runtime::new().map_err(|e| PyRunnerError::PyError(e.to_string()))?;
-        rt.block_on(self.run_file(file))
+        SYNC_RUNTIME.block_on(self.run_file(file))
     }
 
     /// Asynchronously evaluates a single Python expression.
@@ -190,9 +193,7 @@ impl PyRunner {
     ///
     /// **Note:** Calling this from an existing async runtime can lead to panics.
     pub fn eval_sync(&self, code: &str) -> Result<Value, PyRunnerError> {
-        let rt =
-            tokio::runtime::Runtime::new().map_err(|e| PyRunnerError::PyError(e.to_string()))?;
-        rt.block_on(self.eval(code))
+        SYNC_RUNTIME.block_on(self.eval(code))
     }
 
     /// Asynchronously reads a variable from the Python interpreter's global scope.
@@ -214,9 +215,7 @@ impl PyRunner {
     ///
     /// **Note:** Calling this from an existing async runtime can lead to panics.
     pub fn read_variable_sync(&self, var_name: &str) -> Result<Value, PyRunnerError> {
-        let rt =
-            tokio::runtime::Runtime::new().map_err(|e| PyRunnerError::PyError(e.to_string()))?;
-        rt.block_on(self.read_variable(var_name))
+        SYNC_RUNTIME.block_on(self.read_variable(var_name))
     }
 
     /// Asynchronously calls a Python function in the interpreter's global scope.
@@ -255,8 +254,7 @@ impl PyRunner {
         name: &str,
         args: Vec<Value>,
     ) -> Result<Value, PyRunnerError> {
-        let rt = tokio::runtime::Runtime::new().map_err(|e| PyRunnerError::PyError(e.to_string()))?;
-        rt.block_on(self.call_function(name, args))
+        SYNC_RUNTIME.block_on(self.call_function(name, args))
     }
 
     /// Asynchronously calls an async Python function in the interpreter's global scope.
@@ -293,9 +291,7 @@ impl PyRunner {
         name: &str,
         args: Vec<Value>,
     ) -> Result<Value, PyRunnerError> {
-        let rt =
-            tokio::runtime::Runtime::new().map_err(|e| PyRunnerError::PyError(e.to_string()))?;
-        rt.block_on(self.call_async_function(name, args))
+        SYNC_RUNTIME.block_on(self.call_async_function(name, args))
     }
 
     /// Stops the Python execution thread gracefully.
@@ -312,9 +308,7 @@ impl PyRunner {
     ///
     /// **Note:** Calling this from an existing async runtime can lead to panics.
     pub fn stop_sync(&self) -> Result<(), PyRunnerError> {
-        let rt =
-            tokio::runtime::Runtime::new().map_err(|e| PyRunnerError::PyError(e.to_string()))?;
-        rt.block_on(self.stop())
+        SYNC_RUNTIME.block_on(self.stop())
     }
 
     /// Set python venv environment folder (does not change interpreter)
@@ -360,9 +354,7 @@ impl PyRunner {
     ///
     /// **Note:** Calling this from an existing async runtime can lead to panics.
     pub fn set_venv_sync(&self, venv_path: &Path) -> Result<(), PyRunnerError> {
-        let rt =
-            tokio::runtime::Runtime::new().map_err(|e| PyRunnerError::PyError(e.to_string()))?;
-        rt.block_on(self.set_venv(venv_path))
+        SYNC_RUNTIME.block_on(self.set_venv(venv_path))
     }
 }
 
