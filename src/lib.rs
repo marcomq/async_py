@@ -17,7 +17,7 @@ use std::sync::mpsc as std_mpsc;
 use std::thread;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Runtime;
 
 #[derive(Debug)]
 pub(crate) enum CmdType {
@@ -110,14 +110,14 @@ impl PyRunner {
         thread::spawn(move || {
             #[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
             {
+                use tokio::runtime::Builder;
                 let rt = Builder::new_multi_thread().enable_all().build().unwrap();
                 rt.block_on(pyo3_runner::python_thread_main(receiver));
             }
 
             #[cfg(feature = "rustpython")]
             {
-                let rt = Builder::new_current_thread().enable_all().build().unwrap();
-                rt.block_on(rustpython_runner::python_thread_main(receiver));
+                rustpython_runner::python_thread_main(receiver);
             }
         });
 
@@ -291,7 +291,6 @@ impl PyRunner {
     /// * `args`: A vector of `serde_json::Value` to pass as arguments to the function.
     ///
     /// **Note:** This function is safe to call from any context (sync or async).
-    #[cfg(feature = "pyo3")]
     pub fn call_function_sync(
         &self,
         name: &str,
