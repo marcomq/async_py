@@ -92,6 +92,13 @@ pub struct PyRunner {
     sender: mpsc::Sender<PyCommand>,
 }
 
+
+impl Default for PyRunner {
+    fn default() -> Self {
+        PyRunner::new()
+    }
+}
+
 impl PyRunner {
     /// Creates a new `PyRunner` and spawns a dedicated thread for Python execution.
     ///
@@ -153,14 +160,13 @@ impl PyRunner {
         let (tx, rx) = std_mpsc::channel();
         let sender = self.sender.clone();
 
-        let cmd_type_clone = cmd_type; // Clone is implicit as CmdType is Copy
         let task = Box::new(move |rt: &Runtime| {
             let result = rt.block_on(async {
                 // This is the async `send_command` logic, but we can't call it
                 // directly because of `&self` lifetime issues inside the closure.
                 let (responder, receiver) = oneshot::channel();
                 let cmd = PyCommand {
-                    cmd_type: cmd_type_clone,
+                    cmd_type,
                     responder,
                 };
                 sender
@@ -186,6 +192,7 @@ impl PyRunner {
     /// Asynchronously executes a block of Python code.
     ///
     /// * `code`: A string slice containing the Python code to execute.
+    ///
     /// This is equivalent to Python's `exec()` function.
     pub async fn run(&self, code: &str) -> Result<(), PyRunnerError> {
         self.send_command(CmdType::RunCode(code.into()))
@@ -208,6 +215,7 @@ impl PyRunner {
 
     /// Asynchronously runs a python file.
     /// * `file`: Absolute path to a python file to execute.
+    ///
     /// Also loads the path of the file to sys.path for imports.
     pub async fn run_file(&self, file: &Path) -> Result<(), PyRunnerError> {
         self.send_command(CmdType::RunFile(file.to_path_buf()))
@@ -230,8 +238,8 @@ impl PyRunner {
 
     /// Asynchronously evaluates a single Python expression.
     ///
-    /// * `code`: A string slice containing the Python expression to evaluate.
-    ///           Must not contain definitions or multiple lines.
+    /// * `code`: A string slice containing the Python expression to evaluate. Must not contain definitions or multiple lines.
+    ///
     /// Returns a `Result` containing the expression's result as a `serde_json::Value` on success,
     /// or a `PyRunnerError` on failure. This is equivalent to Python's `eval()` function.
     pub async fn eval(&self, code: &str) -> Result<Value, PyRunnerError> {
@@ -254,6 +262,7 @@ impl PyRunner {
     ///
     /// * `var_name`: The name of the variable to read. It can be a dot-separated path
     ///   to access attributes of objects (e.g., "my_module.my_variable").
+    ///
     /// Returns the variable's value as a `serde_json::Value` on success.
     pub async fn read_variable(&self, var_name: &str) -> Result<Value, PyRunnerError> {
         self.send_command(CmdType::ReadVariable(var_name.into()))
@@ -277,6 +286,7 @@ impl PyRunner {
     /// * `name`: The name of the function to call. It can be a dot-separated path
     ///   to access functions within modules (e.g., "my_module.my_function").
     /// * `args`: A vector of `serde_json::Value` to pass as arguments to the function.
+    ///
     /// Returns the function's return value as a `serde_json::Value` on success.
     /// Does not release GIL during await.
     pub async fn call_function(
@@ -313,6 +323,7 @@ impl PyRunner {
     /// * `name`: The name of the function to call. It can be a dot-separated path
     ///   to access functions within modules (e.g., "my_module.my_function").
     /// * `args`: A vector of `serde_json::Value` to pass as arguments to the function.
+    ///
     /// Returns the function's return value as a `serde_json::Value` on success.
     /// Will release GIL during await.
     pub async fn call_async_function(
@@ -374,7 +385,7 @@ impl PyRunner {
             )));
         }
         let set_venv_code = include_str!("set_venv.py");
-        self.run(&set_venv_code).await?;
+        self.run(set_venv_code).await?;
 
         let site_packages = if cfg!(target_os = "windows") {
             venv_path.join("Lib").join("site-packages")
@@ -415,7 +426,7 @@ impl PyRunner {
             )));
         }
         let set_venv_code = include_str!("set_venv.py");
-        self.run_sync(&set_venv_code)?;
+        self.run_sync(set_venv_code)?;
 
         let site_packages = if cfg!(target_os = "windows") {
             venv_path.join("Lib").join("site-packages")

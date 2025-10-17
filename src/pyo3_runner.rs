@@ -25,22 +25,22 @@ pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) 
             let result = match std::mem::replace(&mut cmd.cmd_type, CmdType::Stop) {
                 CmdType::RunCode(code) => {
                     let c_code = CString::new(code).expect("CString::new failed");
-                    py.run(&c_code, Some(&globals), None).map(|_| Value::Null)
+                    py.run(&c_code, Some(globals), None).map(|_| Value::Null)
                 }
                 CmdType::EvalCode(code) => {
                     let c_code = CString::new(code).expect("CString::new failed");
-                    py.eval(&c_code, Some(&globals), None)
-                        .and_then(|obj| py_any_to_json(py, &obj))
+                    py.eval(&c_code, Some(globals), None)
+                        .and_then(|obj| py_any_to_json(&obj))
                 }
-                CmdType::RunFile(file) => handle_run_file(py, &globals, file),
+                CmdType::RunFile(file) => handle_run_file(py, globals, file),
                 CmdType::ReadVariable(var_name) => {
-                    get_py_object(&globals, &var_name).and_then(|obj| py_any_to_json(py, &obj))
+                    get_py_object(globals, &var_name).and_then(|obj| py_any_to_json(&obj))
                 }
                 CmdType::CallFunction { name, args } => {
-                    handle_call_function(py, &globals, name, args)
+                    handle_call_function(py, globals, name, args)
                 }
                 CmdType::CallAsyncFunction { name, args } => {
-                    let func = get_py_object(&globals, &name).unwrap(); // TODO;
+                    let func = get_py_object(globals, &name).unwrap(); // TODO;
                     check_func_callable(&func, &name).unwrap(); // TODO
                     let func = func.unbind();
 
@@ -110,7 +110,7 @@ with open({}, 'r') as f:
         print_path_for_python(&file.to_path_buf())
     );
     let c_code = CString::new(code).expect("CString::new failed");
-    py.run(&c_code, Some(&globals), None).map(|_| Value::Null)
+    py.run(&c_code, Some(globals), None).map(|_| Value::Null)
 }
 
 /// Handles the `CallFunction` command.
@@ -124,7 +124,7 @@ fn handle_call_function(
     check_func_callable(&func, &name)?;
     let t_args = vec_to_py_tuple(&py, args)?;
     let result = func.call1(t_args)?;
-    py_any_to_json(py, &result)
+    py_any_to_json(&result)
 }
 
 fn vec_to_py_tuple<'py>(
@@ -155,13 +155,13 @@ async fn handle_call_async_function(
         let result = loop_obj.call_method1("run_until_complete", (coroutine,))?;
         loop_obj.call_method0("close")?;
 
-        py_any_to_json(py, &result)
+        py_any_to_json(&result)
     });
     let _ = responder.send(result.map_err(|e| e.to_string()));
 }
 
 /// Recursively converts a Python object to a `serde_json::Value`.
-fn py_any_to_json(py: Python, obj: &pyo3::Bound<'_, PyAny>) -> PyResult<Value> {
+fn py_any_to_json(obj: &pyo3::Bound<'_, PyAny>) -> PyResult<Value> {
     if obj.is_none() {
         return Ok(Value::Null);
     }
@@ -186,13 +186,13 @@ fn py_any_to_json(py: Python, obj: &pyo3::Bound<'_, PyAny>) -> PyResult<Value> {
     }
     if let Ok(list) = obj.cast::<PyList>() {
         let items: PyResult<Vec<Value>> =
-            list.iter().map(|item| py_any_to_json(py, &item)).collect();
+            list.iter().map(|item| py_any_to_json(&item)).collect();
         return Ok(Value::Array(items?));
     }
     if let Ok(dict) = obj.cast::<PyDict>() {
         let mut map = serde_json::Map::new();
         for (key, value) in dict.iter() {
-            map.insert(key.to_string(), py_any_to_json(py, &value)?);
+            map.insert(key.to_string(), py_any_to_json(&value)?);
         }
         return Ok(Value::Object(map));
     }
