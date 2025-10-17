@@ -40,14 +40,19 @@ pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) 
                     handle_call_function(py, globals, name, args)
                 }
                 CmdType::CallAsyncFunction { name, args } => {
-                    let func = get_py_object(globals, &name).unwrap(); // TODO;
-                    check_func_callable(&func, &name).unwrap(); // TODO
-                    let func = func.unbind();
+                    let result: PyResult<_> = (|| {
+                        let func = get_py_object(globals, &name)?;
+                        check_func_callable(&func, &name)?;
+                        Ok(func.unbind())
+                    })();
 
-                    py.detach(|| {
-                        tokio::spawn(handle_call_async_function(func, args, cmd.responder))
-                    });
-                    return; // The response is sent async, so we can return early.
+                    match result {
+                        Ok(func) => {
+                            py.detach(|| tokio::spawn(handle_call_async_function(func, args, cmd.responder)));
+                            return; // The response is sent async, so we can return early.
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
                 CmdType::Stop => return receiver.close(),
             };
