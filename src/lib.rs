@@ -10,10 +10,13 @@ mod pyo3_runner;
 #[cfg(feature = "rustpython")]
 mod rustpython_runner;
 
+use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc as std_mpsc;
 use std::thread;
 use thiserror::Error;
+use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug)]
@@ -23,6 +26,7 @@ pub(crate) enum CmdType {
     EvalCode(String),
     ReadVariable(String),
     CallFunction { name: String, args: Vec<Value> },
+    CallAsyncFunction { name: String, args: Vec<Value> },
     Stop,
 }
 /// Represents a command to be sent to the Python execution thread. It includes the
@@ -33,8 +37,26 @@ pub(crate) struct PyCommand {
     responder: oneshot::Sender<Result<Value, String>>,
 }
 
+/// A boxed, send-able future that resolves to a PyRunnerResult.
+type Task = Box<dyn FnOnce(&Runtime) -> Result<Value, PyRunnerError> + Send>;
+
+/// A lazily-initialized worker thread for handling synchronous function calls.
+/// This thread has its own private Tokio runtime to safely block on async operations
+/// without interfering with any existing runtime the user might be in.
+static SYNC_WORKER: Lazy<std_mpsc::Sender<Task>> = Lazy::new(|| {
+    let (tx, rx) = std_mpsc::channel::<Task>();
+
+    thread::spawn(move || {
+        let rt = Runtime::new().expect("Failed to create Tokio runtime for sync worker");
+        // When the sender (tx) is dropped, rx.recv() will return an Err, ending the loop.
+        while let Ok(task) = rx.recv() {
+            let _ = task(&rt); // The result is sent back via a channel inside the task.
+        }
+    });
+    tx
+});
 /// Custom error types for the `PyRunner`.
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum PyRunnerError {
     #[error("Failed to send command to Python thread. The thread may have panicked.")]
     SendCommandFailed,
@@ -70,6 +92,13 @@ pub struct PyRunner {
     sender: mpsc::Sender<PyCommand>,
 }
 
+
+impl Default for PyRunner {
+    fn default() -> Self {
+        PyRunner::new()
+    }
+}
+
 impl PyRunner {
     /// Creates a new `PyRunner` and spawns a dedicated thread for Python execution.
     ///
@@ -87,10 +116,16 @@ impl PyRunner {
         // This is crucial to avoid blocking the async runtime and to manage the GIL correctly.
         thread::spawn(move || {
             #[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
-            pyo3_runner::python_thread_main(receiver);
+            {
+                use tokio::runtime::Builder;
+                let rt = Builder::new_multi_thread().enable_all().build().unwrap();
+                rt.block_on(pyo3_runner::python_thread_main(receiver));
+            }
 
             #[cfg(feature = "rustpython")]
-            rustpython_runner::python_thread_main(receiver);
+            {
+                rustpython_runner::python_thread_main(receiver);
+            }
         });
 
         Self { sender }
@@ -119,17 +154,68 @@ impl PyRunner {
             .map_err(PyRunnerError::PyError)
     }
 
+    /// A private helper function to encapsulate the logic of sending a command
+    /// and receiving a response synchronously.
+    fn send_command_sync(&self, cmd_type: CmdType) -> Result<Value, PyRunnerError> {
+        let (tx, rx) = std_mpsc::channel();
+        let sender = self.sender.clone();
+
+        let task = Box::new(move |rt: &Runtime| {
+            let result = rt.block_on(async {
+                // This is the async `send_command` logic, but we can't call it
+                // directly because of `&self` lifetime issues inside the closure.
+                let (responder, receiver) = oneshot::channel();
+                let cmd = PyCommand {
+                    cmd_type,
+                    responder,
+                };
+                sender
+                    .send(cmd)
+                    .await
+                    .map_err(|_| PyRunnerError::SendCommandFailed)?;
+                receiver
+                    .await
+                    .map_err(|_| PyRunnerError::ReceiveResultFailed.clone())?
+                    .map_err(PyRunnerError::PyError)
+            });
+            if tx.send(result.clone()).is_err() {
+                return Err(PyRunnerError::SendCommandFailed);
+            }
+            result
+        });
+
+        SYNC_WORKER
+            .send(task)
+            .map_err(|_| PyRunnerError::SendCommandFailed)?;
+        rx.recv().map_err(|_| PyRunnerError::ReceiveResultFailed)?
+    }
     /// Asynchronously executes a block of Python code.
     ///
     /// * `code`: A string slice containing the Python code to execute.
+    ///
     /// This is equivalent to Python's `exec()` function.
     pub async fn run(&self, code: &str) -> Result<(), PyRunnerError> {
         self.send_command(CmdType::RunCode(code.into()))
             .await
             .map(|_| ())
     }
+
+    /// Synchronously executes a block of Python code.
+    ///
+    /// This is a blocking wrapper around `run`. It is intended for use in
+    /// synchronous applications.
+    ///
+    /// * `code`: A string slice containing the Python code to execute.
+    ///
+    /// **Note:** This function is safe to call from any context (sync or async).
+    pub fn run_sync(&self, code: &str) -> Result<(), PyRunnerError> {
+        self.send_command_sync(CmdType::RunCode(code.into()))
+            .map(|_| ())
+    }
+
     /// Asynchronously runs a python file.
     /// * `file`: Absolute path to a python file to execute.
+    ///
     /// Also loads the path of the file to sys.path for imports.
     pub async fn run_file(&self, file: &Path) -> Result<(), PyRunnerError> {
         self.send_command(CmdType::RunFile(file.to_path_buf()))
@@ -137,24 +223,62 @@ impl PyRunner {
             .map(|_| ())
     }
 
+    /// Synchronously runs a python file.
+    ///
+    /// This is a blocking wrapper around `run_file`. It is intended for use in
+    /// synchronous applications.
+    ///
+    /// * `file`: Absolute path to a python file to execute.
+    ///
+    /// **Note:** This function is safe to call from any context (sync or async).
+    pub fn run_file_sync(&self, file: &Path) -> Result<(), PyRunnerError> {
+        self.send_command_sync(CmdType::RunFile(file.to_path_buf()))
+            .map(|_| ())
+    }
+
     /// Asynchronously evaluates a single Python expression.
     ///
-    /// * `code`: A string slice containing the Python expression to evaluate.
-    ///           Must not contain definitions or multiple lines.
+    /// * `code`: A string slice containing the Python expression to evaluate. Must not contain definitions or multiple lines.
+    ///
     /// Returns a `Result` containing the expression's result as a `serde_json::Value` on success,
     /// or a `PyRunnerError` on failure. This is equivalent to Python's `eval()` function.
     pub async fn eval(&self, code: &str) -> Result<Value, PyRunnerError> {
         self.send_command(CmdType::EvalCode(code.into())).await
     }
 
+    /// Synchronously evaluates a single Python expression.
+    ///
+    /// This is a blocking wrapper around `eval`. It is intended for use in
+    /// synchronous applications.
+    ///
+    /// * `code`: A string slice containing the Python expression to evaluate.
+    ///
+    /// **Note:** This function is safe to call from any context (sync or async).
+    pub fn eval_sync(&self, code: &str) -> Result<Value, PyRunnerError> {
+        self.send_command_sync(CmdType::EvalCode(code.into()))
+    }
+
     /// Asynchronously reads a variable from the Python interpreter's global scope.
     ///
     /// * `var_name`: The name of the variable to read. It can be a dot-separated path
     ///   to access attributes of objects (e.g., "my_module.my_variable").
+    ///
     /// Returns the variable's value as a `serde_json::Value` on success.
     pub async fn read_variable(&self, var_name: &str) -> Result<Value, PyRunnerError> {
         self.send_command(CmdType::ReadVariable(var_name.into()))
             .await
+    }
+
+    /// Synchronously reads a variable from the Python interpreter's global scope.
+    ///
+    /// This is a blocking wrapper around `read_variable`. It is intended for use in
+    /// synchronous applications.
+    ///
+    /// * `var_name`: The name of the variable to read.
+    ///
+    /// **Note:** This function is safe to call from any context (sync or async).
+    pub fn read_variable_sync(&self, var_name: &str) -> Result<Value, PyRunnerError> {
+        self.send_command_sync(CmdType::ReadVariable(var_name.into()))
     }
 
     /// Asynchronously calls a Python function in the interpreter's global scope.
@@ -162,7 +286,9 @@ impl PyRunner {
     /// * `name`: The name of the function to call. It can be a dot-separated path
     ///   to access functions within modules (e.g., "my_module.my_function").
     /// * `args`: A vector of `serde_json::Value` to pass as arguments to the function.
+    ///
     /// Returns the function's return value as a `serde_json::Value` on success.
+    /// Does not release GIL during await.
     pub async fn call_function(
         &self,
         name: &str,
@@ -175,12 +301,81 @@ impl PyRunner {
         .await
     }
 
+    /// Synchronously calls a Python function in the interpreter's global scope.
+    ///
+    /// This is a blocking wrapper around `call_function`. It will create a new
+    /// Tokio runtime to execute the async function. It is intended for use in
+    /// synchronous applications.
+    ///
+    /// * `name`: The name of the function to call.
+    /// * `args`: A vector of `serde_json::Value` to pass as arguments to the function.
+    ///
+    /// **Note:** This function is safe to call from any context (sync or async).
+    pub fn call_function_sync(&self, name: &str, args: Vec<Value>) -> Result<Value, PyRunnerError> {
+        self.send_command_sync(CmdType::CallFunction {
+            name: name.into(),
+            args,
+        })
+    }
+
+    /// Asynchronously calls an async Python function in the interpreter's global scope.
+    ///
+    /// * `name`: The name of the function to call. It can be a dot-separated path
+    ///   to access functions within modules (e.g., "my_module.my_function").
+    /// * `args`: A vector of `serde_json::Value` to pass as arguments to the function.
+    ///
+    /// Returns the function's return value as a `serde_json::Value` on success.
+    /// Will release GIL during await.
+    pub async fn call_async_function(
+        &self,
+        name: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, PyRunnerError> {
+        self.send_command(CmdType::CallAsyncFunction {
+            name: name.into(),
+            args,
+        })
+        .await
+    }
+
+    /// Synchronously calls an async Python function in the interpreter's global scope.
+    ///
+    /// This is a blocking wrapper around `call_async_function`. It is intended for use in
+    /// synchronous applications.
+    ///
+    /// * `name`: The name of the function to call.
+    /// * `args`: A vector of `serde_json::Value` to pass as arguments to the function.
+    ///
+    /// **Note:** This function is safe to call from any context (sync or async).
+    #[cfg(feature = "pyo3")]
+    pub fn call_async_function_sync(
+        &self,
+        name: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, PyRunnerError> {
+        self.send_command_sync(CmdType::CallAsyncFunction {
+            name: name.into(),
+            args,
+        })
+    }
+
     /// Stops the Python execution thread gracefully.
     pub async fn stop(&self) -> Result<(), PyRunnerError> {
         // We can ignore the `Ok(Value::Null)` result.
         self.send_command(CmdType::Stop).await?;
         Ok(())
     }
+
+    /// Synchronously stops the Python execution thread gracefully.
+    ///
+    /// This is a blocking wrapper around `stop`. It is intended for use in
+    /// synchronous applications.
+    ///
+    /// **Note:** This function is safe to call from any context (sync or async).
+    pub fn stop_sync(&self) -> Result<(), PyRunnerError> {
+        self.send_command_sync(CmdType::Stop).map(|_| ())
+    }
+
     /// Set python venv environment folder (does not change interpreter)
     pub async fn set_venv(&self, venv_path: &Path) -> Result<(), PyRunnerError> {
         if !venv_path.is_dir() {
@@ -190,7 +385,7 @@ impl PyRunner {
             )));
         }
         let set_venv_code = include_str!("set_venv.py");
-        self.run(&set_venv_code).await?;
+        self.run(set_venv_code).await?;
 
         let site_packages = if cfg!(target_os = "windows") {
             venv_path.join("Lib").join("site-packages")
@@ -213,6 +408,46 @@ impl PyRunner {
             with_pth
         ))
         .await
+    }
+
+    /// Synchronously sets the python venv environment folder.
+    ///
+    /// This is a blocking wrapper around `set_venv`. It is intended for use in
+    /// synchronous applications.
+    ///
+    /// * `venv_path`: Path to the venv directory.
+    ///
+    /// **Note:** This function is safe to call from any context (sync or async).
+    pub fn set_venv_sync(&self, venv_path: &Path) -> Result<(), PyRunnerError> {
+        if !venv_path.is_dir() {
+            return Err(PyRunnerError::PyError(format!(
+                "Could not find venv directory {}",
+                venv_path.display()
+            )));
+        }
+        let set_venv_code = include_str!("set_venv.py");
+        self.run_sync(set_venv_code)?;
+
+        let site_packages = if cfg!(target_os = "windows") {
+            venv_path.join("Lib").join("site-packages")
+        } else {
+            let version_code = "f\"python{sys.version_info.major}.{sys.version_info.minor}\"";
+            let py_version = self.eval_sync(version_code)?;
+            venv_path
+                .join("lib")
+                .join(py_version.as_str().unwrap())
+                .join("site-packages")
+        };
+        #[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
+        let with_pth = "True";
+        #[cfg(feature = "rustpython")]
+        let with_pth = "False";
+
+        self.run_sync(&format!(
+            "add_venv_libs_to_syspath({}, {})",
+            print_path_for_python(&site_packages),
+            with_pth
+        ))
     }
 }
 
@@ -252,7 +487,25 @@ z = x + y"#;
     }
 
     #[tokio::test]
+    async fn test_run_sync_from_async() {
+        let executor = PyRunner::new();
+        let code = r#"
+x = 10
+y = 20
+z = x + y"#;
+
+        let result_module = executor.run(code).await;
+
+        assert!(result_module.is_ok());
+
+        let z_val = executor.read_variable_sync("z").unwrap();
+
+        assert_eq!(z_val, Value::Number(30.into()));
+    }
+
+    #[tokio::test]
     async fn test_run_with_function() {
+        // cargo test tests::test_run_with_function --release -- --nocapture
         let executor = PyRunner::new();
         let code = r#"
 def add(a, b):
@@ -260,9 +513,81 @@ def add(a, b):
 "#;
 
         executor.run(code).await.unwrap();
+        let start_time = std::time::Instant::now();
         let result = executor
             .call_function("add", vec![5.into(), 9.into()])
             .await
+            .unwrap();
+        assert_eq!(result, Value::Number(14.into()));
+        let duration = start_time.elapsed();
+        println!(
+            "test_run_with_function took: {} microseconds",
+            duration.as_micros()
+        );
+    }
+
+    #[test]
+    fn test_sync_run_with_function() {
+        // cargo test tests::test_run_with_function --release -- --nocapture
+        let executor = PyRunner::new();
+        let code = r#"
+def add(a, b):
+    return a + b
+"#;
+
+        executor.run_sync(code).unwrap();
+        let start_time = std::time::Instant::now();
+        let result = executor
+            .call_function_sync("add", vec![5.into(), 9.into()])
+            .unwrap();
+        assert_eq!(result, Value::Number(14.into()));
+        let duration = start_time.elapsed();
+        println!(
+            "test_run_with_function_sync took: {} microseconds",
+            duration.as_micros()
+        );
+    }
+
+    #[cfg(feature = "pyo3")]
+    #[tokio::test]
+    async fn test_run_with_async_function() {
+        let executor = PyRunner::new();
+        let code = r#"
+import asyncio
+counter = 0
+
+async def add_and_sleep(a, b, sleep_time):
+    global counter
+    await asyncio.sleep(sleep_time)
+    counter += 1
+    return a + b + counter
+"#;
+
+        executor.run(code).await.unwrap();
+        let result1 =
+            executor.call_async_function("add_and_sleep", vec![5.into(), 10.into(), 1.into()]);
+        let result2 =
+            executor.call_async_function("add_and_sleep", vec![5.into(), 10.into(), 0.1.into()]);
+        let (result1, result2) = tokio::join!(result1, result2);
+        assert_eq!(result1.unwrap(), Value::Number(17.into()));
+        assert_eq!(result2.unwrap(), Value::Number(16.into()));
+    }
+
+    #[cfg(feature = "pyo3")]
+    #[test]
+    fn test_run_with_async_function_sync() {
+        let executor = PyRunner::new();
+        let code = r#"
+import asyncio
+
+async def add(a, b):
+    await asyncio.sleep(0.1)
+    return a + b
+"#;
+
+        executor.run_sync(code).unwrap();
+        let result = executor
+            .call_async_function_sync("add", vec![5.into(), 9.into()])
             .unwrap();
         assert_eq!(result, Value::Number(14.into()));
     }

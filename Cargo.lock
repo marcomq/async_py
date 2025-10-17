@@ -62,6 +62,7 @@ name = "async_py"
 version = "0.2.1"
 dependencies = [
  "dunce",
+ "once_cell",
  "pyo3",
  "rustpython-stdlib",
  "rustpython-vm",
