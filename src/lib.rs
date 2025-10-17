@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
 use tokio::runtime::Runtime;
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug)]
 pub(crate) enum CmdType {
@@ -159,9 +159,17 @@ impl PyRunner {
                 // This is the async `send_command` logic, but we can't call it
                 // directly because of `&self` lifetime issues inside the closure.
                 let (responder, receiver) = oneshot::channel();
-                let cmd = PyCommand { cmd_type: cmd_type_clone, responder };
-                sender.send(cmd).await.map_err(|_| PyRunnerError::SendCommandFailed)?;
-                receiver.await.map_err(|_| PyRunnerError::ReceiveResultFailed.clone())?
+                let cmd = PyCommand {
+                    cmd_type: cmd_type_clone,
+                    responder,
+                };
+                sender
+                    .send(cmd)
+                    .await
+                    .map_err(|_| PyRunnerError::SendCommandFailed)?;
+                receiver
+                    .await
+                    .map_err(|_| PyRunnerError::ReceiveResultFailed.clone())?
                     .map_err(PyRunnerError::PyError)
             });
             if tx.send(result.clone()).is_err() {
@@ -170,7 +178,9 @@ impl PyRunner {
             result
         });
 
-        SYNC_WORKER.send(task).map_err(|_| PyRunnerError::SendCommandFailed)?;
+        SYNC_WORKER
+            .send(task)
+            .map_err(|_| PyRunnerError::SendCommandFailed)?;
         rx.recv().map_err(|_| PyRunnerError::ReceiveResultFailed)?
     }
     /// Asynchronously executes a block of Python code.
@@ -291,11 +301,7 @@ impl PyRunner {
     /// * `args`: A vector of `serde_json::Value` to pass as arguments to the function.
     ///
     /// **Note:** This function is safe to call from any context (sync or async).
-    pub fn call_function_sync(
-        &self,
-        name: &str,
-        args: Vec<Value>,
-    ) -> Result<Value, PyRunnerError> {
+    pub fn call_function_sync(&self, name: &str, args: Vec<Value>) -> Result<Value, PyRunnerError> {
         self.send_command_sync(CmdType::CallFunction {
             name: name.into(),
             args,
@@ -469,7 +475,6 @@ z = x + y"#;
         assert_eq!(z_val, Value::Number(30.into()));
     }
 
-
     #[tokio::test]
     async fn test_run_sync_from_async() {
         let executor = PyRunner::new();
@@ -486,7 +491,7 @@ z = x + y"#;
 
         assert_eq!(z_val, Value::Number(30.into()));
     }
-  
+
     #[tokio::test]
     async fn test_run_with_function() {
         // cargo test tests::test_run_with_function --release -- --nocapture
@@ -504,7 +509,10 @@ def add(a, b):
             .unwrap();
         assert_eq!(result, Value::Number(14.into()));
         let duration = start_time.elapsed();
-        println!("test_run_with_function took: {} microseconds", duration.as_micros());
+        println!(
+            "test_run_with_function took: {} microseconds",
+            duration.as_micros()
+        );
     }
 
     #[test]
@@ -523,7 +531,10 @@ def add(a, b):
             .unwrap();
         assert_eq!(result, Value::Number(14.into()));
         let duration = start_time.elapsed();
-        println!("test_run_with_function_sync took: {} microseconds", duration.as_micros());
+        println!(
+            "test_run_with_function_sync took: {} microseconds",
+            duration.as_micros()
+        );
     }
 
     #[cfg(feature = "pyo3")]
@@ -542,8 +553,10 @@ async def add_and_sleep(a, b, sleep_time):
 "#;
 
         executor.run(code).await.unwrap();
-        let result1 = executor.call_async_function("add_and_sleep", vec![5.into(), 10.into(), 1.into()]);
-        let result2 = executor.call_async_function("add_and_sleep", vec![5.into(), 10.into(), 0.1.into()]);
+        let result1 =
+            executor.call_async_function("add_and_sleep", vec![5.into(), 10.into(), 1.into()]);
+        let result2 =
+            executor.call_async_function("add_and_sleep", vec![5.into(), 10.into(), 0.1.into()]);
         let (result1, result2) = tokio::join!(result1, result2);
         assert_eq!(result1.unwrap(), Value::Number(17.into()));
         assert_eq!(result2.unwrap(), Value::Number(16.into()));
