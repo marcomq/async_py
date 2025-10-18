@@ -548,7 +548,6 @@ def add(a, b):
         );
     }
 
-    #[cfg(feature = "pyo3")]
     #[tokio::test]
     async fn test_run_with_async_function() {
         let executor = PyRunner::new();

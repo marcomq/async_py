@@ -152,15 +152,16 @@ async fn handle_call_async_function(
     responder: oneshot::Sender<Result<Value, String>>,
 ) {
     let result = Python::attach(|py| {
+        // Note: This approach creates a new asyncio event loop for each async call,
+        // which can be inefficient for a high volume of calls. It ensures that each
+        // call is isolated but does not share an event loop for concurrent execution
+        // on the Python side.
         let func = func.bind(py);
         let t_args = vec_to_py_tuple(&py, args)?;
         let coroutine = func.call1(t_args)?;
 
         let asyncio = py.import("asyncio")?;
-        let loop_obj = asyncio.call_method0("new_event_loop")?;
-        asyncio.call_method1("set_event_loop", (loop_obj.clone(),))?;
-        let result = loop_obj.call_method1("run_until_complete", (coroutine,))?;
-        loop_obj.call_method0("close")?;
+        let result = asyncio.call_method1("run", (coroutine,))?;
 
         py_any_to_json(&result)
     });
