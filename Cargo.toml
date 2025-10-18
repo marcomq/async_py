@@ -24,7 +24,7 @@ pyo3 = ["dep:pyo3"]
 rustpython = ["dep:rustpython-vm", "dep:rustpython", "dep:rustpython-stdlib"]
 
 [dependencies.pyo3]
-version = "0.26.0"
+version = "0.26"
 features = ["auto-initialize"]
 optional = true
 

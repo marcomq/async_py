@@ -100,10 +100,7 @@ pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) 
 
 /// Sets up the asyncio event loop and related infrastructure in the Python interpreter.
 /// This is called on-demand when the first async function is executed.
-fn setup_async_infrastructure(
-    vm: &VirtualMachine,
-    scope: &Scope,
-) -> PyResult<AsyncPyState> {
+fn setup_async_infrastructure(vm: &VirtualMachine, scope: &Scope) -> PyResult<AsyncPyState> {
     // Initialize a dedicated asyncio loop, a result queue and helper callbacks
     // in the Python interpreter. The loop will be run in a separate Python
     // thread so that run_coroutine_threadsafe can schedule coroutines onto it.
@@ -137,7 +134,10 @@ def _make_callback(id):
     let globals = &scope.globals;
     let loop_obj = globals.get_item("_loop", vm)?;
     let make_callback_fn = globals.get_item("_make_callback", vm)?;
-    Ok(AsyncPyState { loop_obj, make_callback_fn })
+    Ok(AsyncPyState {
+        loop_obj,
+        make_callback_fn,
+    })
 }
 
 /// Processes a command received from the Rust side.
@@ -200,14 +200,9 @@ fn handle_command(
 
                 let state = async_state.as_ref().unwrap();
                 pending.insert(id, cmd.responder); // Must insert before calling async.
-                if let Err(e) = handle_call_async_function(
-                    vm,
-                    scope.clone(),
-                    state,
-                    id,
-                    &name,
-                    args,
-                ) {
+                if let Err(e) =
+                    handle_call_async_function(vm, scope.clone(), state, id, &name, args)
+                {
                     if let Some(tx) = pending.remove(&id) {
                         let _ = tx.send(Err(e));
                     }
@@ -235,10 +230,22 @@ fn handle_notification(
                         let id_obj = dict.get_item("id", vm).unwrap();
                         let ok_obj = dict.get_item("ok", vm).unwrap();
                         let payload_obj = dict.get_item("payload", vm).unwrap();
-                        let id = id_obj.clone().try_into_value::<i64>(vm).ok().unwrap_or(0) as usize;
+                        let id =
+                            id_obj.clone().try_into_value::<i64>(vm).ok().unwrap_or(0) as usize;
                         if let Some(tx) = pending.remove(&id) {
-                            let ok = ok_obj.clone().try_into_value::<bool>(vm).ok().unwrap_or(false);
-                            let res = if ok { py_to_json(vm, &payload_obj).map_err(print_err_msg) } else { Err(payload_obj.str(vm).map(|s| s.to_string()).unwrap_or_else(|_| "<error>".to_string())) };
+                            let ok = ok_obj
+                                .clone()
+                                .try_into_value::<bool>(vm)
+                                .ok()
+                                .unwrap_or(false);
+                            let res = if ok {
+                                py_to_json(vm, &payload_obj).map_err(print_err_msg)
+                            } else {
+                                Err(payload_obj
+                                    .str(vm)
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|_| "<error>".to_string()))
+                            };
                             let _ = tx.send(res);
                         }
                     }
