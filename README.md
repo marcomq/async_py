@@ -86,7 +86,6 @@ Each call will use its own event loop. This may not be very efficient and change
 
 Make sure to use `call_async_function` for async python functions. Using `call_function` will
 probably raise an error. 
-`call_async_function` is not available for RustPython.
 
 ### Using a venv
 It is generally recommended to use a venv to install pip packages.

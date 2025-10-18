@@ -348,7 +348,6 @@ impl PyRunner {
     /// * `args`: A vector of `serde_json::Value` to pass as arguments to the function.
     ///
     /// **Note:** This function is safe to call from any context (sync or async).
-    #[cfg(feature = "pyo3")]
     pub fn call_async_function_sync(
         &self,
         name: &str,
@@ -570,11 +569,11 @@ async def add_and_sleep(a, b, sleep_time):
         let result2 =
             executor.call_async_function("add_and_sleep", vec![5.into(), 10.into(), 0.1.into()]);
         let (result1, result2) = tokio::join!(result1, result2);
+        // The order of execution is guaranteed by the last timing parameters
         assert_eq!(result1.unwrap(), Value::Number(17.into()));
         assert_eq!(result2.unwrap(), Value::Number(16.into()));
     }
 
-    #[cfg(feature = "pyo3")]
     #[test]
     fn test_run_with_async_function_sync() {
         let executor = PyRunner::new();

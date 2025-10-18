@@ -134,21 +134,14 @@ async fn handle_call_async_function(
             // This gives us access to functions defined there.
             let scope = Scope::with_builtins(None, globals, vm);
             let result: PyResult<Value> = (|| {
-                let asyncio = vm.import("asyncio", 0)?;
-                let loop_obj = asyncio.get_attr("new_event_loop", vm)?.call(vec![], vm)?;
-                asyncio
-                    .get_attr("set_event_loop", vm)?
-                    .call(vec![loop_obj.clone()], vm)?;
+                let asyncio_run = vm.import("asyncio", 0)?.get_attr("run", vm)?;
 
                 let py_args: Vec<PyObjectRef> =
                     args.into_iter().map(|v| json_to_py(vm, v)).collect();
 
                 let coroutine = read_variable(vm, scope.clone(), &name)?.call(py_args, vm)?;
 
-                let result_obj = loop_obj
-                    .get_attr("run_until_complete", vm)?
-                    .call(vec![coroutine], vm)?;
-                loop_obj.get_attr("close", vm)?.call(vec![], vm)?;
+                let result_obj = asyncio_run.call(vec![coroutine], vm)?;
                 py_to_json(vm, &result_obj)
             })();
             result
