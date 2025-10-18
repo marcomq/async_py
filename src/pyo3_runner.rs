@@ -48,7 +48,9 @@ pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) 
 
                     match result {
                         Ok(func) => {
-                            py.detach(|| tokio::spawn(handle_call_async_function(func, args, cmd.responder)));
+                            py.detach(|| {
+                                tokio::spawn(handle_call_async_function(func, args, cmd.responder))
+                            });
                             return; // The response is sent async, so we can return early.
                         }
                         Err(e) => Err(e),
@@ -190,8 +192,7 @@ fn py_any_to_json(obj: &pyo3::Bound<'_, PyAny>) -> PyResult<Value> {
         return Ok(Value::String(s.to_string()));
     }
     if let Ok(list) = obj.cast::<PyList>() {
-        let items: PyResult<Vec<Value>> =
-            list.iter().map(|item| py_any_to_json(&item)).collect();
+        let items: PyResult<Vec<Value>> = list.iter().map(|item| py_any_to_json(&item)).collect();
         return Ok(Value::Array(items?));
     }
     if let Ok(dict) = obj.cast::<PyDict>() {

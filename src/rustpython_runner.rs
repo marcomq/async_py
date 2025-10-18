@@ -4,25 +4,23 @@
 //  git clone https://github.com/marcomq/async_py
 
 use crate::{CmdType, PyCommand};
+use rustpython::InterpreterConfig;
 use rustpython_vm::{
-    builtins::{PyBaseException, PyBool, PyDict, PyFloat, PyInt, PyList, PyStr},
-    convert::ToPyObject,
-    eval,
-    scope::Scope,
-    AsObject, Interpreter, PyObjectRef, PyRef, PyResult, Settings, VirtualMachine,
+    builtins::{PyBaseException, PyBool, PyDict, PyDictRef, PyFloat, PyInt, PyList, PyStr}, convert::ToPyObject, eval, function::ArgMapping, scope::Scope, AsObject, PyObjectRef, PyRef, PyResult, Settings, VirtualMachine
 };
 use serde_json::{json, Map, Number, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// The main loop for the RustPython thread.
-pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
+pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
     let mut settings = Settings::default();
     settings.path_list.push("Lib".to_owned());
-    let interp = Interpreter::with_init(settings, |vm| {
-        vm.add_native_modules(rustpython_stdlib::get_module_inits());
-    });
+    let interp = InterpreterConfig::new()
+        .settings(settings)
+        .init_stdlib()
+        .interpreter();
 
-    interp.enter(|vm| {
+    let scope = interp.enter(|vm| {
         let scope = vm.new_scope_with_builtins();
         vm.run_code_string(
             scope.clone(),
@@ -30,7 +28,10 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
             "<init>".into(),
         )
         .unwrap();
-        while let Some(cmd) = receiver.blocking_recv() {
+        scope
+    });
+    while let Some(cmd) = receiver.recv().await {
+        interp.enter(|vm| {
             let result = match &cmd.cmd_type {
                 CmdType::RunCode(code) => vm
                     .run_code_string(scope.clone(), code, "<string, run>".to_owned())
@@ -48,10 +49,23 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
                         .and_then(|obj| py_to_json(vm, &obj))
                 }
                 CmdType::CallAsyncFunction { name, args } => {
-                    dbg!(name, args);
-                    unimplemented!("Async functions are not supported yet in RustPython")
+                    // We need to clone the globals from the current scope to pass to the async task.
+                    let locals = Some(scope.locals.clone());
+                    let globals = scope.globals.clone();
+                    tokio::spawn(handle_call_async_function(
+                        locals,
+                        globals,
+                        name.clone(),
+                        args.clone(),
+                        cmd.responder,
+                    ));
+                    // The response is sent async, so we can return early.
+                    return;
                 }
-                CmdType::Stop => break,
+                CmdType::Stop => {
+                    receiver.close();
+                    return;
+                }
             };
             let response = result.map_err(|err| {
                 format!(
@@ -61,8 +75,8 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
                 )
             });
             let _ = cmd.responder.send(response);
-        }
-    });
+        });
+    }
 }
 
 fn read_variable(vm: &VirtualMachine, scope: Scope, var_name: &str) -> PyResult<PyObjectRef> {
@@ -81,6 +95,60 @@ fn call_function(vm: &VirtualMachine, scope: Scope, name: &str, args: Vec<Value>
         .map(|v| json_to_py(vm, v))
         .collect::<Vec<_>>();
     func.call(py_args, vm)
+}
+
+async fn handle_call_async_function(
+    locals: Option<ArgMapping>,
+    globals: PyDictRef,
+    name: String,
+    args: Vec<Value>,
+    responder: oneshot::Sender<Result<Value, String>>,
+) {
+    // Each async task runs in its own interpreter to allow for concurrency.
+    // They share the globals from the main interpreter's scope.
+    let name_clone = name.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut settings = Settings::default();
+        settings.path_list.push("Lib".to_owned());
+        let interp = InterpreterConfig::new()
+            .settings(settings)
+            .init_stdlib()
+            .interpreter();
+
+        interp.enter(|vm| {
+            let scope = Scope::with_builtins(locals, globals, vm);
+            let result: PyResult<Value> = (|| {
+                let asyncio = vm.import("asyncio", 0)?;
+                let loop_obj = asyncio.get_attr("new_event_loop", vm)?.call(vec![], vm)?;
+                asyncio
+                    .get_attr("set_event_loop", vm)?
+                    .call(vec![loop_obj.clone()], vm)?;
+
+                let py_args: Vec<PyObjectRef> =
+                    args.into_iter().map(|v| json_to_py(vm, v)).collect();
+
+                let coroutine = read_variable(vm, scope.clone(), &name)?.call(py_args, vm)?;
+
+                let result_obj = loop_obj
+                    .get_attr("run_until_complete", vm)?
+                    .call(vec![coroutine], vm)?;
+                loop_obj.get_attr("close", vm)?.call(vec![], vm)?;
+                py_to_json(vm, &result_obj)
+            })();
+            result
+        })
+    })
+    .await
+    .unwrap(); // unwrap the JoinError
+
+    let response = result.map_err(|err| {
+        format!(
+            "Cannot apply async function call '{}': {}",
+            name_clone,
+            print_err_msg(err)
+        )
+    });
+    let _ = responder.send(response);
 }
 
 /// Converts a `serde_json::Value` to a `PyObjectRef`.

@@ -92,7 +92,6 @@ pub struct PyRunner {
     sender: mpsc::Sender<PyCommand>,
 }
 
-
 impl Default for PyRunner {
     fn default() -> Self {
         PyRunner::new()
@@ -124,7 +123,9 @@ impl PyRunner {
 
             #[cfg(feature = "rustpython")]
             {
-                rustpython_runner::python_thread_main(receiver);
+                use tokio::runtime::Builder;
+                let rt = Builder::new_current_thread().enable_all().build().unwrap();
+                rt.block_on(rustpython_runner::python_thread_main(receiver));
             }
         });
 
