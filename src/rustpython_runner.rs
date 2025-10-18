@@ -13,22 +13,32 @@ use tokio::sync::{mpsc, oneshot};
 
 /// The main loop for the RustPython thread.
 pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
-    let mut settings = Settings::default();
-    settings.path_list.push("Lib".to_owned());
-    let interp = InterpreterConfig::new()
-        .settings(settings)
+    // Create a single, shared sys.modules dictionary that is thread-safe.
+    let (shared_sys_modules, shared_sys_path) = InterpreterConfig::new()
         .init_stdlib()
-        .interpreter();
+        .interpreter()
+        .enter(|vm| {
+            let modules = vm.sys_module.get_attr("modules", vm).unwrap().downcast::<PyDict>().unwrap();
+            let path = vm.sys_module.get_attr("path", vm).unwrap().downcast::<PyList>().unwrap();
+            (modules, path)
+        });
 
-    let scope = interp.enter(|vm| {
+    let interp = InterpreterConfig::new().init_stdlib().interpreter();
+    let (scope, main_globals) = interp.enter(|vm| {
+        // Replace the default sys.modules with our shared one.
+        vm.sys_module.set_attr("modules", shared_sys_modules.clone().to_pyobject(vm), vm).unwrap();
+        // Replace the default sys.path with our shared one.
+        vm.sys_module.set_attr("path", shared_sys_path.clone().to_pyobject(vm), vm).unwrap();
+
         let scope = vm.new_scope_with_builtins();
+        // Add current directory to path for local module imports in tests.
         vm.run_code_string(
             scope.clone(),
             "import sys; sys.path.append('./')",
             "<init>".into(),
         )
         .unwrap();
-        scope
+        (scope.clone(), scope.globals.clone())
     });
     while let Some(cmd) = receiver.recv().await {
         interp.enter(|vm| {
@@ -50,13 +60,12 @@ pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) 
                 }
                 CmdType::CallAsyncFunction { name, args } => {
                     // We need to clone the globals from the current scope to pass to the async task.
-                    let locals = Some(scope.locals.clone());
-                    let globals = scope.globals.clone();
                     tokio::spawn(handle_call_async_function(
-                        locals,
-                        globals,
+                        main_globals.clone(),
                         name.clone(),
                         args.clone(),
+                        shared_sys_modules.clone(),
+                        shared_sys_path.clone(),
                         cmd.responder,
                     ));
                     // The response is sent async, so we can return early.
@@ -98,10 +107,11 @@ fn call_function(vm: &VirtualMachine, scope: Scope, name: &str, args: Vec<Value>
 }
 
 async fn handle_call_async_function(
-    locals: Option<ArgMapping>,
     globals: PyDictRef,
     name: String,
     args: Vec<Value>,
+    shared_sys_modules: PyDictRef,
+    shared_sys_path: PyRef<PyList>,
     responder: oneshot::Sender<Result<Value, String>>,
 ) {
     // Each async task runs in its own interpreter to allow for concurrency.
@@ -116,7 +126,13 @@ async fn handle_call_async_function(
             .interpreter();
 
         interp.enter(|vm| {
-            let scope = Scope::with_builtins(locals, globals, vm);
+            // Use the globals from the main thread and the shared sys.modules.
+            vm.sys_module.set_attr("modules", shared_sys_modules.to_pyobject(vm), vm).unwrap();
+            // Use the shared sys.path.
+            vm.sys_module.set_attr("path", shared_sys_path.to_pyobject(vm), vm).unwrap();
+            // We create a new scope but use the globals from the main interpreter.
+            // This gives us access to functions defined there.
+            let scope = Scope::with_builtins(None, globals, vm);
             let result: PyResult<Value> = (|| {
                 let asyncio = vm.import("asyncio", 0)?;
                 let loop_obj = asyncio.get_attr("new_event_loop", vm)?.call(vec![], vm)?;
