@@ -2,71 +2,167 @@
 //  © Copyright 2025, by Marco Mengelkoch
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/async_py
-
 use crate::{print_path_for_python, CmdType, PyCommand};
 use pyo3::{
     exceptions::PyKeyError,
     prelude::*,
-    types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString},
+    types::{PyBool, PyCFunction, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple},
     IntoPyObjectExt,
 };
 use serde_json::Value;
+use std::collections::HashMap;
 use std::ffi::CString;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
+
+/// Holds the Python objects related to the async infrastructure.
+struct AsyncPyState {
+    loop_obj: Py<PyAny>,
+    result_queue: Py<PyAny>,
+    make_callback_fn: Py<PyAny>,
+}
 
 /// The main loop for the Python thread. This function is spawned in a new
 /// thread and is responsible for all Python interaction.
 pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
     Python::initialize();
-    let globals = Python::attach(|py| PyDict::new(py).unbind());
-    while let Some(mut cmd) = receiver.recv().await {
-        Python::attach(|py| {
-            let globals = globals.bind(py);
-            let result = match std::mem::replace(&mut cmd.cmd_type, CmdType::Stop) {
-                CmdType::RunCode(code) => {
-                    let c_code = CString::new(code).expect("CString::new failed");
-                    py.run(&c_code, Some(globals), None).map(|_| Value::Null)
-                }
-                CmdType::EvalCode(code) => {
-                    let c_code = CString::new(code).expect("CString::new failed");
-                    py.eval(&c_code, Some(globals), None)
-                        .and_then(|obj| py_any_to_json(&obj))
-                }
-                CmdType::RunFile(file) => handle_run_file(py, globals, file),
-                CmdType::ReadVariable(var_name) => {
-                    get_py_object(globals, &var_name).and_then(|obj| py_any_to_json(&obj))
-                }
-                CmdType::CallFunction { name, args } => {
-                    handle_call_function(py, globals, name, args)
-                }
-                CmdType::CallAsyncFunction { name, args } => {
-                    let result: PyResult<_> = (|| {
-                        let func = get_py_object(globals, &name)?;
-                        check_func_callable(&func, &name)?;
-                        Ok(func.unbind())
-                    })();
 
-                    match result {
-                        Ok(func) => {
-                            py.detach(|| tokio::spawn(handle_call_async_function(func, args, cmd.responder)));
-                            return; // The response is sent async, so we can return early.
+    // State for async operations
+    let mut pending: HashMap<usize, oneshot::Sender<Result<Value, String>>> = HashMap::new();
+    let mut next_id: usize = 1;
+    let mut async_state: Option<AsyncPyState> = None;
+
+    // Notifier to wake up the Rust select! loop from Python.
+    let notify = std::sync::Arc::new(Notify::new());
+
+    // Create globals and inject the notifier callback.
+    let globals = Python::attach(|py| -> PyResult<Py<PyDict>> {
+        let globals = PyDict::new(py);
+        let rust_notify_fn = {
+            let notify = notify.clone();
+            PyCFunction::new_closure(py, None, None, move |py, _| {
+                notify.notify_one();
+                Ok::<pyo3::Py<pyo3::PyAny>, PyErr>(py.py().None())
+            })?
+            .unbind()
+        };
+        globals.set_item("_rust_notify", rust_notify_fn)?;
+        Ok(globals.unbind())
+    })
+    .expect("Failed to initialize Python globals");
+
+    loop {
+        tokio::select! {
+            // Branch 1: Wait for a new command from the channel.
+            Some(cmd) = receiver.recv() => {
+                if let CmdType::Stop = cmd.cmd_type {
+                    receiver.close();
+                } else {
+                    handle_command(&globals, &mut async_state, &mut pending, &mut next_id, cmd);
+                }
+            },
+            // Branch 2: Wait for a notification from Python that a result is ready.
+            _ = notify.notified(), if !pending.is_empty() && async_state.is_some() => {
+                handle_notification(async_state.as_ref().unwrap(), &mut pending);
+            }
+            // If the receiver is closed and there are no more pending tasks, exit.
+            else => {
+                if receiver.is_closed() && pending.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Sets up the asyncio event loop and related infrastructure in Python.
+fn setup_async_infrastructure(py: Python, globals: &Bound<PyDict>) -> PyResult<AsyncPyState> {
+    let code = r#"
+import asyncio, threading, queue, traceback
+_loop = asyncio.new_event_loop()
+def _run_loop():
+    asyncio.set_event_loop(_loop)
+    _loop.run_forever()
+_thread = threading.Thread(target=_run_loop, daemon=True)
+_thread.start()
+_result_queue = queue.Queue()
+def _async_done_cb(fut, id):
+    try:
+        res = fut.result()
+        _result_queue.put({'id': id, 'ok': True, 'payload': res})
+    except Exception as e:
+        tb = traceback.format_exception_only(type(e), e)
+        _result_queue.put({'id': id, 'ok': False, 'payload': ''.join(tb)})
+    finally:
+        _rust_notify()
+def _make_callback(id):
+    def _cb(fut):
+        _async_done_cb(fut, id)
+    return _cb
+"#;
+    let c_code = CString::new(code).expect("CString::new failed");
+    py.run(&c_code, Some(globals), None)?;
+    Ok(AsyncPyState {
+        loop_obj: globals.get_item("_loop")?.unwrap().unbind(),
+        result_queue: globals.get_item("_result_queue")?.unwrap().unbind(),
+        make_callback_fn: globals.get_item("_make_callback")?.unwrap().unbind(),
+    })
+}
+
+/// Processes a command received from the Rust side.
+fn handle_command(
+    globals: &Py<PyDict>,
+    async_state: &mut Option<AsyncPyState>,
+    pending: &mut HashMap<usize, oneshot::Sender<Result<Value, String>>>,
+    next_id: &mut usize,
+    mut cmd: PyCommand,
+) {
+    Python::attach(|py| {
+        let globals = globals.bind(py);
+        let result = match std::mem::replace(&mut cmd.cmd_type, CmdType::Stop) {
+            CmdType::RunCode(code) => {
+                let c_code = CString::new(code).expect("CString::new failed");
+                py.run(&c_code, Some(globals), None).map(|_| Value::Null)
+            }
+            CmdType::EvalCode(code) => {
+                let c_code = CString::new(code).expect("CString::new failed");
+                py.eval(&c_code, Some(globals), None)
+                    .and_then(|obj| py_any_to_json(&obj))
+            }
+            CmdType::RunFile(file) => handle_run_file(py, globals, file),
+            CmdType::ReadVariable(var_name) => {
+                get_py_object(globals, &var_name).and_then(|obj| py_any_to_json(&obj))
+            }
+            CmdType::CallFunction { name, args } => handle_call_function(py, globals, name, args),
+            CmdType::CallAsyncFunction { name, args } => {
+                let id = *next_id;
+                *next_id += 1;
+
+                // Initialize async infrastructure on first use.
+                if async_state.is_none() {
+                    match setup_async_infrastructure(py, globals) {
+                        Ok(state) => *async_state = Some(state),
+                        Err(e) => {
+                            let _ = cmd.responder.send(Err(e.to_string()));
+                            return;
                         }
-                        Err(e) => Err(e),
                     }
                 }
-                CmdType::Stop => return receiver.close(),
-            };
+                let state = async_state.as_ref().unwrap();
+                pending.insert(id, cmd.responder);
 
-            // Convert PyErr to a string representation to avoid exposing it outside this module.
-            let response = match result {
-                Ok(value) => Ok(value),
-                Err(e) => Err(e.to_string()),
-            };
-            let _ = cmd.responder.send(response);
-        });
-        // After the loop, we can send a final confirmation for the Stop command if needed,
-        // but the current implementation in lib.rs handles the channel closing.
-    }
+                if let Err(e) = handle_call_async_function(py, globals, state, id, &name, args) {
+                    if let Some(tx) = pending.remove(&id) {
+                        let _ = tx.send(Err(e));
+                    }
+                }
+                return; // Response is sent async, so we return early.
+            }
+            CmdType::Stop => return, // Handled in the select! loop.
+        };
+
+        let response = result.map_err(|e| e.to_string());
+        let _ = cmd.responder.send(response);
+    });
 }
 
 /// Resolves a potentially dot-separated Python object name from the globals dictionary.
@@ -101,7 +197,7 @@ fn check_func_callable(func: &Bound<PyAny>, name: &str) -> PyResult<()> {
 
 fn handle_run_file(
     py: Python,
-    globals: &pyo3::Bound<'_, PyDict>,
+    globals: &Bound<'_, PyDict>,
     file: std::path::PathBuf,
 ) -> PyResult<Value> {
     let code = format!(
@@ -121,7 +217,7 @@ with open({}, 'r') as f:
 /// Handles the `CallFunction` command.
 fn handle_call_function(
     py: Python,
-    globals: &pyo3::Bound<'_, PyDict>,
+    globals: &Bound<'_, PyDict>,
     name: String,
     args: Vec<Value>,
 ) -> PyResult<Value> {
@@ -140,29 +236,82 @@ fn vec_to_py_tuple<'py>(
         .into_iter()
         .map(|v| json_value_to_pyobject(*py, v))
         .collect::<PyResult<Vec<_>>>()?;
-    pyo3::types::PyTuple::new(*py, py_args)
+    PyTuple::new(*py, py_args)
 }
 
 /// Handles the `CallAsyncFunction` command.
-async fn handle_call_async_function(
-    func: Py<PyAny>,
+fn handle_call_async_function(
+    py: Python,
+    globals: &Bound<PyDict>,
+    async_state: &AsyncPyState,
+    id: usize,
+    name: &str,
     args: Vec<Value>,
-    responder: oneshot::Sender<Result<Value, String>>,
+) -> Result<(), String> {
+    let func = get_py_object(globals, name)
+        .and_then(|f| check_func_callable(&f, name).map(|_| f))
+        .map_err(|e| e.to_string())?;
+
+    let t_args = vec_to_py_tuple(&py, args).map_err(|e| e.to_string())?;
+    let coroutine = func.call1(t_args).map_err(|e| e.to_string())?;
+
+    let asyncio = py.import("asyncio").map_err(|e| e.to_string())?;
+    let run_threadsafe = asyncio
+        .getattr("run_coroutine_threadsafe")
+        .map_err(|e| e.to_string())?;
+
+    let fut = run_threadsafe
+        .call1((coroutine, async_state.loop_obj.bind(py)))
+        .map_err(|e| e.to_string())?;
+
+    let cb = async_state
+        .make_callback_fn
+        .bind(py)
+        .call1((id,))
+        .map_err(|e| e.to_string())?;
+
+    fut.call_method1("add_done_callback", (cb,))
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Drains the Python-side result queue and completes any pending responders.
+fn handle_notification(
+    async_state: &AsyncPyState,
+    pending: &mut HashMap<usize, oneshot::Sender<Result<Value, String>>>,
 ) {
-    let result = Python::attach(|py| {
-        let func = func.bind(py);
-        let t_args = vec_to_py_tuple(&py, args)?;
-        let coroutine = func.call1(t_args)?;
-
-        let asyncio = py.import("asyncio")?;
-        let loop_obj = asyncio.call_method0("new_event_loop")?;
-        asyncio.call_method1("set_event_loop", (loop_obj.clone(),))?;
-        let result = loop_obj.call_method1("run_until_complete", (coroutine,))?;
-        loop_obj.call_method0("close")?;
-
-        py_any_to_json(&result)
+    Python::attach(|py| {
+        let get_nowait = match async_state.result_queue.bind(py).getattr("get_nowait") {
+            Ok(f) => f,
+            Err(_) => return, // Should not happen if setup is correct
+        };
+        while let Ok(item) = get_nowait.call0() {
+            if let Ok(dict) = item.downcast::<PyDict>() {
+                let id = dict
+                    .get_item("id")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap();
+                if let Some(tx) = pending.remove(&id) {
+                    let ok = dict
+                        .get_item("ok")
+                        .unwrap()
+                        .unwrap()
+                        .extract::<bool>()
+                        .unwrap();
+                    let payload = dict.get_item("payload").unwrap().unwrap();
+                    let res = if ok {
+                        py_any_to_json(&payload).map_err(|e| e.to_string())
+                    } else {
+                        Err(payload.to_string())
+                    };
+                    let _ = tx.send(res);
+                }
+            }
+        }
     });
-    let _ = responder.send(result.map_err(|e| e.to_string()));
 }
 
 /// Recursively converts a Python object to a `serde_json::Value`.
@@ -190,8 +339,7 @@ fn py_any_to_json(obj: &pyo3::Bound<'_, PyAny>) -> PyResult<Value> {
         return Ok(Value::String(s.to_string()));
     }
     if let Ok(list) = obj.cast::<PyList>() {
-        let items: PyResult<Vec<Value>> =
-            list.iter().map(|item| py_any_to_json(&item)).collect();
+        let items: PyResult<Vec<Value>> = list.iter().map(|item| py_any_to_json(&item)).collect();
         return Ok(Value::Array(items?));
     }
     if let Ok(dict) = obj.cast::<PyDict>() {
