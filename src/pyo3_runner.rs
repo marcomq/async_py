@@ -154,11 +154,18 @@ async fn handle_call_async_function(
         let t_args = vec_to_py_tuple(&py, args)?;
         let coroutine = func.call1(t_args)?;
 
-        let asyncio = py.import("asyncio")?;
-        let loop_obj = asyncio.call_method0("new_event_loop")?;
-        asyncio.call_method1("set_event_loop", (loop_obj.clone(),))?;
+        let asyncio = py.import("asyncio")?; // py.import_bound("asyncio")? in newer pyo3
+        let loop_obj = match asyncio.call_method0("get_running_loop") {
+            Ok(loop_obj) => loop_obj,
+            Err(_) => {
+                // If no loop is running, create a new one and set it.
+                let new_loop = asyncio.call_method0("new_event_loop")?;
+                asyncio.call_method1("set_event_loop", (new_loop.clone(),))?;
+                new_loop
+            }
+        };
+
         let result = loop_obj.call_method1("run_until_complete", (coroutine,))?;
-        loop_obj.call_method0("close")?;
 
         py_any_to_json(&result)
     });
