@@ -51,7 +51,10 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
                     dbg!(name, args);
                     unimplemented!("Async functions are not supported yet in RustPython")
                 }
-                CmdType::Stop => break,
+                CmdType::Stop => {
+                    receiver.close();
+                    Ok(Value::Null)
+                }
             };
             let response = result.map_err(|err| {
                 format!(

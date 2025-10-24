@@ -37,24 +37,6 @@ pub(crate) struct PyCommand {
     responder: oneshot::Sender<Result<Value, String>>,
 }
 
-/// A boxed, send-able future that resolves to a PyRunnerResult.
-type Task = Box<dyn FnOnce(&Runtime) -> Result<Value, PyRunnerError> + Send>;
-
-/// A lazily-initialized worker thread for handling synchronous function calls.
-/// This thread has its own private Tokio runtime to safely block on async operations
-/// without interfering with any existing runtime the user might be in.
-static SYNC_WORKER: Lazy<std_mpsc::Sender<Task>> = Lazy::new(|| {
-    let (tx, rx) = std_mpsc::channel::<Task>();
-
-    thread::spawn(move || {
-        let rt = Runtime::new().expect("Failed to create Tokio runtime for sync worker");
-        // When the sender (tx) is dropped, rx.recv() will return an Err, ending the loop.
-        while let Ok(task) = rx.recv() {
-            let _ = task(&rt); // The result is sent back via a channel inside the task.
-        }
-    });
-    tx
-});
 /// Custom error types for the `PyRunner`.
 #[derive(Error, Debug, Clone)]
 pub enum PyRunnerError {
@@ -85,6 +67,27 @@ pub fn print_path_for_python(path: &PathBuf) -> String {
         format!("r\"{}\"", cleanup_path_for_python(path))
     }
 }
+
+/// A boxed, send-able future that resolves to a PyRunnerResult.
+type Task = Box<dyn FnOnce(&Runtime) -> Result<Value, PyRunnerError> + Send>;
+
+/// A lazily-initialized worker thread for handling synchronous function calls
+/// to functions that otherwise return a future. It will only be engaged when 
+/// calling `..._sync()` functions of PyRunner.
+/// This thread has its own private Tokio runtime to safely block on async operations
+/// without interfering with any existing runtime the user might be in.
+static SYNC_WORKER: Lazy<std_mpsc::Sender<Task>> = Lazy::new(|| {
+    let (tx, rx) = std_mpsc::channel::<Task>();
+
+    thread::spawn(move || {
+        let rt = Runtime::new().expect("Failed to create Tokio runtime for sync worker");
+        // When the sender (tx) is dropped, rx.recv() will return an Err, ending the loop.
+        while let Ok(task) = rx.recv() {
+            let _ = task(&rt); // The result is sent back via a channel inside the task.
+        }
+    });
+    tx
+});
 
 /// Manages a dedicated thread for executing Python code asynchronously.
 #[derive(Clone)]
@@ -733,5 +736,60 @@ result = mymodule.my_func()
         let result = runner.eval("dummy_package.dummy_func()").await.unwrap();
 
         assert_eq!(result, Value::String("hello from venv".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_pyrunner_thread_safety() {
+        let runner = PyRunner::new();
+        runner.run("x = 0").await.unwrap();
+
+        let mut handles = vec![];
+
+        for i in 0..5 {
+            let runner_clone = runner.clone();
+            let handle = tokio::spawn(async move {
+                // Each task increments 'x' in the shared Python interpreter
+                runner_clone.run(&format!("x += {}", i)).await.unwrap();
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all tasks to complete
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let final_x = runner.read_variable("x").await.unwrap();
+        // Expected: 0 + 1 + 2 + 3 + 4 = 10
+        assert_eq!(final_x, Value::Number(10.into()));
+    }
+
+    #[test]
+    fn test_pyrunner_std_thread_safety() {
+        let runner = PyRunner::new();
+        runner.run_sync("x = 0").unwrap();
+
+        let mut handles = vec![];
+
+        for i in 0..5 {
+            let runner_clone = runner.clone();
+            // Spawn a new OS thread
+            let handle = thread::spawn(move || {
+                // Use the _sync version for non-async contexts
+                runner_clone.run_sync(&format!("x += {}", i)).unwrap();
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let final_x = runner.read_variable_sync("x").unwrap();
+        // Expected: 0 + 1 + 2 + 3 + 4 = 10
+        assert_eq!(final_x, Value::Number(10.into()));
+
+        runner.stop_sync().unwrap();
     }
 }

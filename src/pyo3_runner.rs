@@ -54,7 +54,10 @@ pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) 
                         Err(e) => Err(e),
                     }
                 }
-                CmdType::Stop => return receiver.close(),
+                CmdType::Stop => {
+                    receiver.close();
+                    Ok(Value::Null)
+                }
             };
 
             // Convert PyErr to a string representation to avoid exposing it outside this module.
