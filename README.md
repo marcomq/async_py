@@ -88,6 +88,46 @@ Make sure to use `call_async_function` for async python functions. Using `call_f
 probably raise an error. 
 `call_async_function` is not available for RustPython.
 
+### Thread Safety
+
+The `PyRunner` is designed to be safely shared across multiple threads.
+
+You can clone a `PyRunner` instance and move it into different threads. All commands sent from any clone are funneled through a channel to a single, dedicated OS thread that houses the Python interpreter. This design correctly handles Python's Global Interpreter Lock (GIL) by ensuring that only one Python operation is attempted at any given time within that interpreter instance.
+
+Here is an example of using `PyRunner` from multiple `std::thread`s:
+
+```rust
+use async_py::{PyRunner, PyRunnerError};
+use std::thread;
+
+fn main() -> Result<(), PyRunnerError> {
+    let runner = PyRunner::new();
+    runner.run_sync("x = 0")?;
+
+    let mut handles = vec![];
+
+    for i in 0..5 {
+        let runner_clone = runner.clone();
+        let handle = thread::spawn(move || {
+            // Use the _sync versions for non-async contexts
+            runner_clone.run_sync(&format!("x += {}", i)).unwrap();
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let final_x = runner.read_variable_sync("x")?;
+    // Expected: 0 + 1 + 2 + 3 + 4 = 10
+    assert_eq!(final_x, Value::Number(10.into()));
+
+    runner.stop_sync()?;
+    Ok(())
+}
+```
+
 ### Using a venv
 It is generally recommended to use a venv to install pip packages.
 While you cannot switch the interpreter version with this crate, you can use an
