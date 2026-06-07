@@ -19,7 +19,8 @@ Add `async_py` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-async_py = "0.2.0"
+async_py = "0.3"
+serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -27,6 +28,7 @@ tokio = { version = "1", features = ["full"] }
 
 ```rust
 use async_py::PyRunner;
+use serde_json::Value;
 
 #[tokio::main]
 async fn main() {
@@ -53,8 +55,20 @@ def greet(name):
 
 ### Async Python Example
 
+`PyRunner` can call regular Python functions with `call_function` and Python
+coroutines with `call_async_function`. Use the async call for functions declared
+with `async def`; calling them through `call_function` will return the coroutine
+object instead of awaiting it.
+
+The Python interpreter still runs on one dedicated worker thread. Normal CPU-bound
+Python code is serialized by that worker and by the Python GIL. Python coroutines
+can make progress while they are awaiting, so multiple calls to async Python
+functions can overlap during `await` points such as `asyncio.sleep`, network I/O,
+or other cooperative async operations.
+
 ```rust
 use async_py::PyRunner;
+use serde_json::Value;
 
 #[tokio::main]
 async fn main() {
@@ -82,11 +96,13 @@ Both function calls are triggered to run async code at the same time. While the 
 the second can already start and also increment the counter first. Therefore,
 result1 will wait longer and compute 5 + 10 + 2, while the result2 can compute 5 + 10 + 1.
 
-Each call will use its own event loop. This may not be very efficient and changed later.
+Each `call_async_function` call creates and drives its own Python event loop.
+That keeps calls independent and easy to use from Rust async code, but it is not
+the same as a shared long-running Python event loop. If you need shared Python
+async state, keep it in Python globals or wrap the behavior in a Python function.
 
-Make sure to use `call_async_function` for async python functions. Using `call_function` will
-probably raise an error. 
-`call_async_function` is not available for RustPython.
+`call_async_function` is only available with the default PyO3 backend. The
+RustPython backend currently reports async function calls as unsupported.
 
 ### Thread Safety
 
@@ -138,6 +154,37 @@ let runner = PyRunner::new();
 runner.set_venv(&Path::new("/path/to/venv")).await?;
 ```
 
+`set_venv` does not activate a shell environment or replace the Python executable.
+It adds the venv's `site-packages` directory to the runner's `sys.path`, which is
+enough for imports from that environment.
+
+This works well with [`uv`](https://docs.astral.sh/uv/). `uv venv` creates a
+`.venv` directory by default, and `uv sync` keeps that environment populated from
+your Python project metadata. From Rust, point `async_py` at the same directory:
+
+```rust
+use async_py::PyRunner;
+use std::path::Path;
+
+# async fn example() -> Result<(), async_py::PyRunnerError> {
+let runner = PyRunner::new();
+runner.set_venv(Path::new(".venv")).await?;
+runner.run("import your_python_dependency").await?;
+# Ok(())
+# }
+```
+
+For a Python project managed by `uv`, a typical setup is:
+
+```sh
+uv init
+uv add numpy
+uv sync
+```
+
+Then call `set_venv(".venv")` before importing those packages. If you configure
+`uv` to use a different project environment path, pass that path instead.
+
 ### rustpython
 PyO3 has usually the best compatibility for python packages.
 But if you want to use python on android, wasm, or if you don't want to use any
@@ -149,3 +196,27 @@ Cargo.toml
 [dependencies]
 async_py = { features = ["rustpython"] } 
 ```
+
+### Comparison with inline-python
+
+[`inline-python`](https://docs.rs/inline-python/) is a good fit when you want to
+write small Python snippets directly inside Rust source with the `python!` macro.
+It also has a reusable `Context` for sharing globals between macro invocations.
+
+`async_py` is aimed at a different workflow:
+
+- Python code is provided as strings or files at runtime, not as Rust-tokenized
+  macro input.
+- Calls are async-friendly from Rust: commands are sent to a dedicated worker
+  thread and awaited through Tokio.
+- A `PyRunner` can be cloned and shared across Rust tasks or threads while still
+  serializing interpreter access safely.
+- It has explicit helpers for calling named Python functions, reading globals,
+  running files, and adding venv/`uv`-managed dependencies to `sys.path`.
+- It offers an optional RustPython backend for targets where embedding CPython
+  through PyO3 is not desirable.
+
+Use `inline-python` when compile-time inline snippets and macro ergonomics are
+the main goal. Use `async_py` when Python execution should be driven from async
+Rust code, loaded from runtime strings/files, shared through a runner, or wired
+to a project venv.

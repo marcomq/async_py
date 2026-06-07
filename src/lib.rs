@@ -5,18 +5,17 @@
 
 //! A library for calling Python code asynchronously from Rust.
 
-#[cfg(feature = "pyo3")]
+#[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
 mod pyo3_runner;
 #[cfg(feature = "rustpython")]
 mod rustpython_runner;
 
-use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use thiserror::Error;
-use tokio::runtime::Runtime;
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug)]
@@ -52,7 +51,7 @@ pub enum PyRunnerError {
 
 fn cleanup_path_for_python(path: &PathBuf) -> String {
     dunce::canonicalize(path)
-        .unwrap()
+        .unwrap_or_else(|_| path.clone())
         .to_string_lossy()
         .replace("\\", "/")
 }
@@ -67,27 +66,6 @@ pub fn print_path_for_python(path: &PathBuf) -> String {
         format!("r\"{}\"", cleanup_path_for_python(path))
     }
 }
-
-/// A boxed, send-able future that resolves to a PyRunnerResult.
-type Task = Box<dyn FnOnce(&Runtime) -> Result<Value, PyRunnerError> + Send>;
-
-/// A lazily-initialized worker thread for handling synchronous function calls
-/// to functions that otherwise return a future. It will only be engaged when 
-/// calling `..._sync()` functions of PyRunner.
-/// This thread has its own private Tokio runtime to safely block on async operations
-/// without interfering with any existing runtime the user might be in.
-static SYNC_WORKER: Lazy<std_mpsc::Sender<Task>> = Lazy::new(|| {
-    let (tx, rx) = std_mpsc::channel::<Task>();
-
-    thread::spawn(move || {
-        let rt = Runtime::new().expect("Failed to create Tokio runtime for sync worker");
-        // When the sender (tx) is dropped, rx.recv() will return an Err, ending the loop.
-        while let Ok(task) = rx.recv() {
-            let _ = task(&rt); // The result is sent back via a channel inside the task.
-        }
-    });
-    tx
-});
 
 /// Manages a dedicated thread for executing Python code asynchronously.
 #[derive(Clone)]
@@ -159,37 +137,41 @@ impl PyRunner {
     /// A private helper function to encapsulate the logic of sending a command
     /// and receiving a response synchronously.
     fn send_command_sync(&self, cmd_type: CmdType) -> Result<Value, PyRunnerError> {
-        let (tx, rx) = std_mpsc::channel();
         let sender = self.sender.clone();
+        let send_and_receive = move || {
+            let (responder, receiver) = oneshot::channel();
+            let cmd = PyCommand {
+                cmd_type,
+                responder,
+            };
 
-        let task = Box::new(move |rt: &Runtime| {
-            let result = rt.block_on(async {
-                // This is the async `send_command` logic, but we can't call it
-                // directly because of `&self` lifetime issues inside the closure.
-                let (responder, receiver) = oneshot::channel();
-                let cmd = PyCommand {
-                    cmd_type,
-                    responder,
-                };
-                sender
-                    .send(cmd)
-                    .await
-                    .map_err(|_| PyRunnerError::SendCommandFailed)?;
-                receiver
-                    .await
-                    .map_err(|_| PyRunnerError::ReceiveResultFailed.clone())?
-                    .map_err(PyRunnerError::PyError)
-            });
-            if tx.send(result.clone()).is_err() {
-                return Err(PyRunnerError::SendCommandFailed);
+            match sender.try_send(cmd) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(PyRunnerError::SendCommandFailed);
+                }
+                Err(mpsc::error::TrySendError::Full(cmd)) => {
+                    sender
+                        .blocking_send(cmd)
+                        .map_err(|_| PyRunnerError::SendCommandFailed)?;
+                }
             }
-            result
-        });
 
-        SYNC_WORKER
-            .send(task)
-            .map_err(|_| PyRunnerError::SendCommandFailed)?;
-        rx.recv().map_err(|_| PyRunnerError::ReceiveResultFailed)?
+            receiver
+                .blocking_recv()
+                .map_err(|_| PyRunnerError::ReceiveResultFailed)?
+                .map_err(PyRunnerError::PyError)
+        };
+
+        if Handle::try_current().is_ok() {
+            let (tx, rx) = std_mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(send_and_receive());
+            });
+            rx.recv().map_err(|_| PyRunnerError::ReceiveResultFailed)?
+        } else {
+            send_and_receive()
+        }
     }
     /// Asynchronously executes a block of Python code.
     ///
@@ -349,7 +331,7 @@ impl PyRunner {
     /// * `args`: A vector of `serde_json::Value` to pass as arguments to the function.
     ///
     /// **Note:** This function is safe to call from any context (sync or async).
-    #[cfg(feature = "pyo3")]
+    #[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
     pub fn call_async_function_sync(
         &self,
         name: &str,
@@ -550,7 +532,7 @@ def add(a, b):
         );
     }
 
-    #[cfg(feature = "pyo3")]
+    #[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
     #[tokio::test]
     async fn test_run_with_async_function() {
         let executor = PyRunner::new();
@@ -576,7 +558,7 @@ async def add_and_sleep(a, b, sleep_time):
         assert_eq!(result2.unwrap(), Value::Number(16.into()));
     }
 
-    #[cfg(feature = "pyo3")]
+    #[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
     #[test]
     fn test_run_with_async_function_sync() {
         let executor = PyRunner::new();
@@ -627,6 +609,48 @@ async def add(a, b):
         let result = executor.eval(code).await;
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn test_send_after_stop_returns_error() {
+        let runner = PyRunner::new();
+
+        runner.stop().await.unwrap();
+        let result = runner.run("x = 1").await;
+
+        assert!(matches!(result, Err(PyRunnerError::SendCommandFailed)));
+    }
+
+    #[test]
+    fn test_sync_send_after_stop_returns_error() {
+        let runner = PyRunner::new();
+
+        runner.stop_sync().unwrap();
+        let result = runner.run_sync("x = 1");
+
+        assert!(matches!(result, Err(PyRunnerError::SendCommandFailed)));
+    }
+
+    #[cfg(feature = "rustpython")]
+    #[tokio::test]
+    async fn test_rustpython_async_function_reports_unsupported() {
+        let runner = PyRunner::new();
+        let result = runner.call_async_function("missing", vec![]).await;
+
+        assert!(matches!(result, Err(PyRunnerError::PyError(_))));
+        assert_eq!(runner.eval("1 + 1").await.unwrap(), Value::Number(2.into()));
+    }
+
+    #[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
+    #[tokio::test]
+    async fn test_pyo3_embedded_nul_reports_error_without_stopping_runner() {
+        let runner = PyRunner::new();
+        let code = "x = 1\0y = 2";
+        let result = runner.run(code).await;
+
+        assert!(matches!(result, Err(PyRunnerError::PyError(_))));
+        assert_eq!(runner.eval("1 + 1").await.unwrap(), Value::Number(2.into()));
+    }
+
     #[tokio::test]
     async fn test_sample_readme() {
         let runner = PyRunner::new();
