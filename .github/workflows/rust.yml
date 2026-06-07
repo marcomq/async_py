@@ -15,9 +15,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        feature: [pyo3]
-        # feature: [pyo3, rustpython]
+        include:
+          - os: ubuntu-latest
+            feature: pyo3
+          - os: macos-latest
+            feature: pyo3
+          - os: windows-latest
+            feature: pyo3
+          - os: ubuntu-latest
+            feature: rustpython
 
     steps:
     - name: Checkout repository
