@@ -101,8 +101,10 @@ That keeps calls independent and easy to use from Rust async code, but it is not
 the same as a shared long-running Python event loop. If you need shared Python
 async state, keep it in Python globals or wrap the behavior in a Python function.
 
-`call_async_function` is only available with the default PyO3 backend. The
-RustPython backend currently reports async function calls as unsupported.
+`call_async_function` is part of the public API for both backends, but only the
+default PyO3 backend provides runtime support for awaiting Python coroutines.
+With the RustPython backend, calling `call_async_function` returns an unsupported
+error at runtime.
 
 ### Thread Safety
 

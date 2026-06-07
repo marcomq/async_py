@@ -215,12 +215,7 @@ fn print_err_msg(vm: &VirtualMachine, error: PyRef<PyBaseException>) -> String {
         println!("Traceback (most recent call last):");
         for trace in tb.iter() {
             let file = trace.frame.code.source_path.as_str();
-            let original_line = trace.lineno.get();
-            let line = if file == "main.py" {
-                original_line - 2 // sys.path import has 2 additional lines
-            } else {
-                original_line
-            };
+            let line = trace.lineno.get();
             println!(
                 "  File \"{file}\", line {line}, in {}",
                 trace.frame.code.obj_name
