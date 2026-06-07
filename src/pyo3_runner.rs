@@ -5,7 +5,7 @@
 
 use crate::{print_path_for_python, CmdType, PyCommand};
 use pyo3::{
-    exceptions::PyKeyError,
+    exceptions::{PyKeyError, PyValueError},
     prelude::*,
     types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString},
     IntoPyObjectExt,
@@ -13,6 +13,15 @@ use pyo3::{
 use serde_json::Value;
 use std::ffi::CString;
 use tokio::sync::{mpsc, oneshot};
+
+fn python_code_to_cstring(code: String) -> PyResult<CString> {
+    CString::new(code).map_err(|err| {
+        PyErr::new::<PyValueError, _>(format!(
+            "Python code contains an embedded NUL byte at position {}",
+            err.nul_position()
+        ))
+    })
+}
 
 /// The main loop for the Python thread. This function is spawned in a new
 /// thread and is responsible for all Python interaction.
@@ -23,15 +32,13 @@ pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) 
         Python::attach(|py| {
             let globals = globals.bind(py);
             let result = match std::mem::replace(&mut cmd.cmd_type, CmdType::Stop) {
-                CmdType::RunCode(code) => {
-                    let c_code = CString::new(code).expect("CString::new failed");
-                    py.run(&c_code, Some(globals), None).map(|_| Value::Null)
-                }
-                CmdType::EvalCode(code) => {
-                    let c_code = CString::new(code).expect("CString::new failed");
+                CmdType::RunCode(code) => python_code_to_cstring(code)
+                    .and_then(|c_code| py.run(&c_code, Some(globals), None))
+                    .map(|_| Value::Null),
+                CmdType::EvalCode(code) => python_code_to_cstring(code).and_then(|c_code| {
                     py.eval(&c_code, Some(globals), None)
                         .and_then(|obj| py_any_to_json(&obj))
-                }
+                }),
                 CmdType::RunFile(file) => handle_run_file(py, globals, file),
                 CmdType::ReadVariable(var_name) => {
                     get_py_object(globals, &var_name).and_then(|obj| py_any_to_json(&obj))
@@ -48,7 +55,9 @@ pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) 
 
                     match result {
                         Ok(func) => {
-                            py.detach(|| tokio::spawn(handle_call_async_function(func, args, cmd.responder)));
+                            py.detach(|| {
+                                tokio::spawn(handle_call_async_function(func, args, cmd.responder))
+                            });
                             return; // The response is sent async, so we can return early.
                         }
                         Err(e) => Err(e),
@@ -114,10 +123,15 @@ sys.path.insert(0, {})
 with open({}, 'r') as f:
     exec(f.read())
 "#,
-        print_path_for_python(&file.parent().unwrap().to_path_buf()),
+        print_path_for_python(
+            &file
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(""))
+                .to_path_buf()
+        ),
         print_path_for_python(&file.to_path_buf())
     );
-    let c_code = CString::new(code).expect("CString::new failed");
+    let c_code = python_code_to_cstring(code)?;
     py.run(&c_code, Some(globals), None).map(|_| Value::Null)
 }
 
@@ -200,8 +214,7 @@ fn py_any_to_json(obj: &pyo3::Bound<'_, PyAny>) -> PyResult<Value> {
         return Ok(Value::String(s.to_string()));
     }
     if let Ok(list) = obj.cast::<PyList>() {
-        let items: PyResult<Vec<Value>> =
-            list.iter().map(|item| py_any_to_json(&item)).collect();
+        let items: PyResult<Vec<Value>> = list.iter().map(|item| py_any_to_json(&item)).collect();
         return Ok(Value::Array(items?));
     }
     if let Ok(dict) = obj.cast::<PyDict>() {

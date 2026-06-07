@@ -3,7 +3,7 @@
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/async_py
 
-use crate::{CmdType, PyCommand};
+use crate::{print_path_for_python, CmdType, PyCommand};
 use rustpython_vm::{
     builtins::{PyBaseException, PyBool, PyDict, PyFloat, PyInt, PyList, PyStr},
     convert::ToPyObject,
@@ -12,19 +12,20 @@ use rustpython_vm::{
     AsObject, Interpreter, PyObjectRef, PyRef, PyResult, Settings, VirtualMachine,
 };
 use serde_json::{json, Map, Number, Value};
+use std::fs;
 use tokio::sync::mpsc;
 
 /// The main loop for the RustPython thread.
 pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
     let mut settings = Settings::default();
     settings.path_list.push("Lib".to_owned());
-    let interp = Interpreter::with_init(settings, |vm| {
-        vm.add_native_modules(rustpython_stdlib::get_module_inits());
-    });
+    let builder = Interpreter::builder(settings);
+    let stdlib_modules = rustpython_stdlib::stdlib_module_defs(&builder.ctx);
+    let interp = builder.add_native_modules(&stdlib_modules).build();
 
     interp.enter(|vm| {
         let scope = vm.new_scope_with_builtins();
-        vm.run_code_string(
+        vm.run_string(
             scope.clone(),
             "import sys; sys.path.append('./')",
             "<init>".into(),
@@ -33,13 +34,31 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
         while let Some(cmd) = receiver.blocking_recv() {
             let result = match &cmd.cmd_type {
                 CmdType::RunCode(code) => vm
-                    .run_code_string(scope.clone(), code, "<string, run>".to_owned())
+                    .run_string(scope.clone(), code, "<string, run>".to_owned())
                     .map(|_| Value::Null),
                 CmdType::EvalCode(code) => eval::eval(vm, code, scope.clone(), "<string, eval>")
                     .and_then(|obj| py_to_json(vm, &obj)),
-                CmdType::RunFile(file) => vm
-                    .run_script(scope.clone(), file.to_str().unwrap())
-                    .map(|_| Value::Null),
+                CmdType::RunFile(file) => match (file.parent(), file.to_str()) {
+                    (Some(parent), Some(file)) => {
+                        let parent = parent.to_path_buf();
+                        let init_path = format!(
+                            "import sys\nsys.path.insert(0, {})",
+                            print_path_for_python(&parent)
+                        );
+                        let source = fs::read_to_string(file)
+                            .map_err(|err| vm.new_os_error(err.to_string()));
+
+                        vm.run_string(scope.clone(), &init_path, "<run_file>".to_owned())
+                            .and_then(|_| {
+                                source.and_then(|source| {
+                                    vm.run_string(scope.clone(), &source, file.to_owned())
+                                })
+                            })
+                            .map(|_| Value::Null)
+                    }
+                    (None, _) => Err(vm.new_value_error("file path has no parent".to_owned())),
+                    (_, None) => Err(vm.new_value_error("file path must be UTF-8".to_owned())),
+                },
                 CmdType::ReadVariable(var_name) => {
                     read_variable(vm, scope.clone(), var_name).and_then(|obj| py_to_json(vm, &obj))
                 }
@@ -48,8 +67,10 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
                         .and_then(|obj| py_to_json(vm, &obj))
                 }
                 CmdType::CallAsyncFunction { name, args } => {
-                    dbg!(name, args);
-                    unimplemented!("Async functions are not supported yet in RustPython")
+                    let _ = (name, args);
+                    Err(vm.new_not_implemented_error(
+                        "Async functions are not supported yet in RustPython".to_owned(),
+                    ))
                 }
                 CmdType::Stop => {
                     receiver.close();
@@ -60,7 +81,7 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
                 format!(
                     "Cannot apply cmd {:?}: {}",
                     cmd.cmd_type,
-                    print_err_msg(err)
+                    print_err_msg(vm, err)
                 )
             });
             let _ = cmd.responder.send(response);
@@ -141,7 +162,7 @@ fn py_to_json(vm: &VirtualMachine, obj: &PyObjectRef) -> PyResult<Value> {
         ));
     }
     if let Some(s) = obj.downcast_ref::<PyStr>() {
-        return Ok(Value::String(s.as_str().to_owned()));
+        return Ok(Value::String(s.to_string_lossy().into_owned()));
     }
     if let Some(list) = obj.downcast_ref::<PyList>() {
         let vec = list
@@ -157,20 +178,20 @@ fn py_to_json(vm: &VirtualMachine, obj: &PyObjectRef) -> PyResult<Value> {
             let key_str = key
                 .downcast_ref::<PyStr>()
                 .ok_or_else(|| vm.new_type_error("dict keys must be strings".to_owned()))?
-                .as_str()
-                .to_owned();
+                .to_string_lossy()
+                .into_owned();
             map.insert(key_str, py_to_json(vm, &value)?);
         }
         return Ok(Value::Object(map));
     }
     // fallback for types that can convert to primitives
-    if let Some(b) = obj.clone().try_into_value::<bool>(vm).ok() {
+    if let Ok(b) = obj.clone().try_into_value::<bool>(vm) {
         return Ok(Value::Bool(b));
     }
-    if let Some(i) = obj.clone().try_into_value::<i64>(vm).ok() {
+    if let Ok(i) = obj.clone().try_into_value::<i64>(vm) {
         return Ok(Value::Number(i.into()));
     }
-    if let Some(f) = obj.clone().try_into_value::<f64>(vm).ok() {
+    if let Ok(f) = obj.clone().try_into_value::<f64>(vm) {
         return Ok(Value::Number(
             Number::from_f64(f).unwrap_or_else(|| Number::from(0)),
         ));
@@ -182,19 +203,19 @@ fn py_to_json(vm: &VirtualMachine, obj: &PyObjectRef) -> PyResult<Value> {
     Ok(Value::String(fallback.to_string()))
 }
 
-fn print_err_msg(error: PyRef<PyBaseException>) -> String {
-    let msg = format!("{:?}", &error);
+fn print_err_msg(vm: &VirtualMachine, error: PyRef<PyBaseException>) -> String {
+    let mut rendered = String::new();
+    let msg = if vm.write_exception(&mut rendered, &error).is_ok() {
+        rendered.trim().to_owned()
+    } else {
+        format!("{:?}", &error)
+    };
     println!("error: {}", &msg);
-    if let Some(tb) = error.traceback() {
+    if let Some(tb) = error.__traceback__() {
         println!("Traceback (most recent call last):");
         for trace in tb.iter() {
             let file = trace.frame.code.source_path.as_str();
-            let original_line = trace.lineno.to_usize();
-            let line = if file == "main.py" {
-                original_line - 2 // sys.path import has 2 additional lines
-            } else {
-                original_line
-            };
+            let line = trace.lineno.get();
             println!(
                 "  File \"{file}\", line {line}, in {}",
                 trace.frame.code.obj_name
