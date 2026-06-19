@@ -11,18 +11,46 @@ env:
 
 jobs:
   test:
-    name: Test ${{ matrix.feature }} on ${{ matrix.os }}
+    name: Test ${{ matrix.feature }} on ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
+          # Linux amd64
           - os: ubuntu-latest
+            name: linux-amd64
+            feature: pyo3
+          - os: ubuntu-latest
+            name: linux-amd64
+            feature: rustpython
+          # Linux arm64 (native GitHub-hosted arm64 runner)
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
+            feature: pyo3
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
+            feature: rustpython
+          # macOS x86_64 (Intel)
+          - os: macos-15-intel
+            name: macos-x86_64
+            feature: pyo3
+          - os: macos-15-intel
+            name: macos-x86_64
+            feature: rustpython
+          # macOS arm64 (Apple Silicon)
+          - os: macos-latest
+            name: macos-arm64
             feature: pyo3
           - os: macos-latest
+            name: macos-arm64
+            feature: rustpython
+          # Windows amd64
+          - os: windows-latest
+            name: windows-amd64
             feature: pyo3
           - os: windows-latest
-            feature: pyo3
-          - os: ubuntu-latest
+            name: windows-amd64
             feature: rustpython
 
     steps:
@@ -40,10 +68,29 @@ jobs:
 
     - name: Cache cargo dependencies
       uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ matrix.feature }}
 
     - name: Run tests (pyo3)
       if: matrix.feature == 'pyo3'
       run: cargo test --verbose --features pyo3
+
+    # Guards the load-bearing `mt19937 = "~3.2"` pin in Cargo.toml: rustpython-stdlib
+    # declares an upper-bound-only `mt19937 = "<=3.2"` requirement, so an accidental
+    # loosening here (or a future rustpython-stdlib bump) can make cargo resolve two
+    # separate, incompatible mt19937 copies side by side, which breaks the build. Fail
+    # loudly if more than one version is ever resolved.
+    - name: Assert a single resolved mt19937 version
+      if: matrix.feature == 'rustpython'
+      shell: bash
+      run: |
+        count=$(cargo tree -i mt19937 --no-default-features --features rustpython 2>/dev/null | grep -cE '^mt19937 v')
+        echo "Resolved mt19937 versions: $count"
+        cargo tree -i mt19937 --no-default-features --features rustpython 2>/dev/null | grep -E '^mt19937 v' || true
+        if [ "$count" -ne 1 ]; then
+          echo "::error::Expected exactly one resolved mt19937 version, found $count. See the mt19937 pin note in Cargo.toml."
+          exit 1
+        fi
 
     - name: Run tests (rustpython)
       if: matrix.feature == 'rustpython'

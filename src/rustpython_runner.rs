@@ -103,13 +103,13 @@ fn call_function(vm: &VirtualMachine, scope: Scope, name: &str, args: Vec<Value>
     let py_args = args
         .into_iter()
         .map(|v| json_to_py(vm, v))
-        .collect::<Vec<_>>();
+        .collect::<PyResult<Vec<_>>>()?;
     func.call(py_args, vm)
 }
 
 /// Converts a `serde_json::Value` to a `PyObjectRef`.
-fn json_to_py(vm: &VirtualMachine, val: Value) -> PyObjectRef {
-    match val {
+fn json_to_py(vm: &VirtualMachine, val: Value) -> PyResult<PyObjectRef> {
+    Ok(match val {
         Value::Null => vm.ctx.none(),
         Value::Bool(b) => vm.ctx.new_bool(b).to_pyobject(vm),
         Value::Number(n) => {
@@ -123,17 +123,20 @@ fn json_to_py(vm: &VirtualMachine, val: Value) -> PyObjectRef {
         }
         Value::String(s) => vm.ctx.new_str(s).to_pyobject(vm),
         Value::Array(a) => {
-            let elements = a.into_iter().map(|v| json_to_py(vm, v)).collect();
+            let elements = a
+                .into_iter()
+                .map(|v| json_to_py(vm, v))
+                .collect::<PyResult<Vec<_>>>()?;
             vm.ctx.new_list(elements).to_pyobject(vm)
         }
         Value::Object(o) => {
             let dict = vm.ctx.new_dict();
             for (k, v) in o {
-                dict.set_item(&k, json_to_py(vm, v), vm).unwrap();
+                dict.set_item(&k, json_to_py(vm, v)?, vm)?;
             }
             dict.to_pyobject(vm)
         }
-    }
+    })
 }
 
 /// Converts a `PyObjectRef` to a `serde_json::Value`.

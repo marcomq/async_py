@@ -14,16 +14,16 @@ categories = ["api-bindings", "asynchronous", "external-ffi-bindings"]
 dunce = "1"
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread"] }
+tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread", "time"] }
 
 [features]
 default = ["pyo3"]
 # default = ["rustpython"]
 pyo3 = ["dep:pyo3"]
-rustpython = ["dep:rustpython-vm", "dep:rustpython-stdlib"]
+rustpython = ["dep:rustpython-vm", "dep:rustpython-stdlib", "dep:mt19937"]
 
 [dependencies.pyo3]
-version = "0.28"
+version = "0.29"
 features = ["auto-initialize"]
 optional = true
 
@@ -36,6 +36,20 @@ features = ["threading", "serde", "importlib"]
 version = "0.5"
 optional = true
 features = ["threading"]
+
+# rustpython-stdlib's `random` module needs the `_random`/MT19937 implementation
+# from this crate. rustpython-stdlib 0.5.0 itself declares `mt19937 = "<=3.2"`
+# (an upper-bound-only requirement, not a caret range), so cargo is otherwise
+# free to satisfy that with the much older 2.0.1, which doesn't have the APIs
+# rustpython-stdlib 0.5.0's source actually calls and fails to compile - this is
+# what consumers hit with a stale lockfile. Pinning `~3.2` here (instead of a
+# bare lower-bound `>=3`) is required to make cargo's resolver land both this
+# crate's and rustpython-stdlib's dependency on the *same* mt19937 instance
+# (3.2.0, the highest version in their shared compatible range) rather than
+# resolving two separate, unrelated copies side by side.
+[dependencies.mt19937]
+version = "~3.2"
+optional = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -14,9 +14,26 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+
+/// Stack size for the dedicated Python execution thread.
+///
+/// RustPython's tree-walking interpreter uses much more native stack per Python
+/// call frame than CPython does, especially in debug builds. The default 2 MiB
+/// thread stack can overflow after only a handful of nested calls, which corrupts
+/// the stack and crashes the process (observed as SIGILL on aarch64, since jumping
+/// to a clobbered/misaligned return address traps as an illegal instruction on that
+/// architecture rather than the SIGSEGV typically seen on x86_64).
+///
+/// Empirically bisected on aarch64 macOS (debug build): 16 MiB still crashed at a
+/// recursion depth as shallow as 200; 64 MiB survived depth 2000 cleanly (well
+/// past where a graceful recursion error would normally fire first). 64 MiB is
+/// used here as a safety margin over that; it costs virtual address space, not
+/// physical memory, since pages are only committed as the stack actually grows.
+const WORKER_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub(crate) enum CmdType {
@@ -33,7 +50,7 @@ pub(crate) enum CmdType {
 /// result back.
 pub(crate) struct PyCommand {
     cmd_type: CmdType,
-    responder: oneshot::Sender<Result<Value, String>>,
+    responder: std_mpsc::Sender<Result<Value, String>>,
 }
 
 /// Custom error types for the `PyRunner`.
@@ -47,6 +64,9 @@ pub enum PyRunnerError {
 
     #[error("Python execution error: {0:?}")]
     PyError(String),
+
+    #[error("Timed out waiting for the Python execution thread")]
+    Timeout,
 }
 
 fn cleanup_path_for_python(path: &PathBuf) -> String {
@@ -71,6 +91,20 @@ pub fn print_path_for_python(path: &PathBuf) -> String {
 #[derive(Clone)]
 pub struct PyRunner {
     sender: mpsc::Sender<PyCommand>,
+    /// Optional ceiling on how long a caller waits for a single command.
+    ///
+    /// `None` (the default) preserves the historic behavior of waiting forever,
+    /// which is what `PyRunner::new()` keeps doing for backward compatibility.
+    /// Set this via `with_timeout` if a wedged Python call (e.g. a network
+    /// request whose own timeout doesn't fire, such as a stuck DNS lookup)
+    /// should not be able to hang callers forever.
+    ///
+    /// Note that a timeout only frees the *caller* waiting on that command; it
+    /// cannot forcibly interrupt the Python code itself. If the stuck command
+    /// never returns, it permanently occupies the single dedicated execution
+    /// thread, so all *subsequent* commands will then also fail with
+    /// `PyRunnerError::Timeout` once their own deadlines pass.
+    timeout: Option<Duration>,
 }
 
 impl Default for PyRunner {
@@ -94,73 +128,135 @@ impl PyRunner {
 
         // Spawn a new OS thread to handle all Python-related work.
         // This is crucial to avoid blocking the async runtime and to manage the GIL correctly.
-        thread::spawn(move || {
-            #[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
-            {
-                use tokio::runtime::Builder;
-                let rt = Builder::new_multi_thread().enable_all().build().unwrap();
-                rt.block_on(pyo3_runner::python_thread_main(receiver));
-            }
+        // A generous explicit stack size is required: the default 2 MiB thread stack
+        // is not enough headroom for RustPython's interpreter (see `WORKER_STACK_SIZE`).
+        thread::Builder::new()
+            .stack_size(WORKER_STACK_SIZE)
+            .spawn(move || {
+                #[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
+                {
+                    use tokio::runtime::Builder;
+                    let rt = Builder::new_multi_thread().enable_all().build().unwrap();
+                    rt.block_on(pyo3_runner::python_thread_main(receiver));
+                }
 
-            #[cfg(feature = "rustpython")]
-            {
-                rustpython_runner::python_thread_main(receiver);
-            }
-        });
+                #[cfg(feature = "rustpython")]
+                {
+                    rustpython_runner::python_thread_main(receiver);
+                }
+            })
+            .expect("failed to spawn the dedicated Python execution thread");
 
-        Self { sender }
+        Self {
+            sender,
+            timeout: None,
+        }
+    }
+
+    /// Returns a copy of this `PyRunner` configured to time out commands that take
+    /// longer than `timeout` to complete.
+    ///
+    /// Without a timeout (the default), a Python call that never returns - for
+    /// example a network call whose own timeout doesn't actually fire, such as a
+    /// stuck DNS lookup - wedges every later call forever, since all commands run
+    /// sequentially on one dedicated thread. Setting a timeout bounds how long any
+    /// individual caller waits; see the field docs on `PyRunner::timeout` for the
+    /// remaining caveat that this cannot interrupt the stuck call itself.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
     }
 
     /// A private helper function to encapsulate the logic of sending a command
     /// and receiving a response.
     async fn send_command(&self, cmd_type: CmdType) -> Result<Value, PyRunnerError> {
-        // Create a one-shot channel to receive the result from the Python thread.
-        let (responder, receiver) = oneshot::channel();
+        // Use a plain std channel (instead of a tokio oneshot) so the same
+        // `PyCommand::responder` type works for both the async and the blocking
+        // sync receive paths below, the latter of which needs `recv_timeout`.
+        let (responder, receiver) = std_mpsc::channel();
         let cmd = PyCommand {
             cmd_type,
             responder,
         };
 
-        // Send the command to the Python thread.
-        self.sender
-            .send(cmd)
-            .await
-            .map_err(|_| PyRunnerError::SendCommandFailed)?;
+        let work = async {
+            // Send the command to the Python thread.
+            self.sender
+                .send(cmd)
+                .await
+                .map_err(|_| PyRunnerError::SendCommandFailed)?;
 
-        // Await the result from the Python thread.
-        receiver
-            .await
-            .map_err(|_| PyRunnerError::ReceiveResultFailed)?
-            .map_err(PyRunnerError::PyError)
+            // Await the result from the Python thread without blocking this
+            // runtime's worker thread.
+            tokio::task::spawn_blocking(move || receiver.recv())
+                .await
+                .map_err(|_| PyRunnerError::ReceiveResultFailed)?
+                .map_err(|_| PyRunnerError::ReceiveResultFailed)?
+                .map_err(PyRunnerError::PyError)
+        };
+
+        match self.timeout {
+            Some(duration) => tokio::time::timeout(duration, work)
+                .await
+                .unwrap_or(Err(PyRunnerError::Timeout)),
+            None => work.await,
+        }
     }
 
     /// A private helper function to encapsulate the logic of sending a command
     /// and receiving a response synchronously.
     fn send_command_sync(&self, cmd_type: CmdType) -> Result<Value, PyRunnerError> {
         let sender = self.sender.clone();
-        let send_and_receive = move || {
-            let (responder, receiver) = oneshot::channel();
+        let timeout = self.timeout;
+        let send_and_receive = move || -> Result<Value, PyRunnerError> {
+            let (responder, receiver) = std_mpsc::channel();
             let cmd = PyCommand {
                 cmd_type,
                 responder,
             };
 
-            match sender.try_send(cmd) {
-                Ok(()) => {}
+            let mut pending = match sender.try_send(cmd) {
+                Ok(()) => None,
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     return Err(PyRunnerError::SendCommandFailed);
                 }
-                Err(mpsc::error::TrySendError::Full(cmd)) => {
-                    sender
-                        .blocking_send(cmd)
-                        .map_err(|_| PyRunnerError::SendCommandFailed)?;
+                Err(mpsc::error::TrySendError::Full(cmd)) => Some(cmd),
+            };
+
+            // The channel is bounded (capacity 32); if it's full because the worker
+            // thread is busy (or wedged on a prior command), poll for room instead
+            // of calling `blocking_send`, which would otherwise wait forever even
+            // when a timeout was requested.
+            if let Some(cmd) = pending.take() {
+                let deadline = timeout.map(|d| Instant::now() + d);
+                let mut cmd = cmd;
+                loop {
+                    match sender.try_send(cmd) {
+                        Ok(()) => break,
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            return Err(PyRunnerError::SendCommandFailed);
+                        }
+                        Err(mpsc::error::TrySendError::Full(c)) => {
+                            if deadline.is_some_and(|dl| Instant::now() >= dl) {
+                                return Err(PyRunnerError::Timeout);
+                            }
+                            cmd = c;
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                    }
                 }
             }
 
-            receiver
-                .blocking_recv()
-                .map_err(|_| PyRunnerError::ReceiveResultFailed)?
-                .map_err(PyRunnerError::PyError)
+            match timeout {
+                Some(duration) => receiver
+                    .recv_timeout(duration)
+                    .map_err(|_| PyRunnerError::Timeout)?
+                    .map_err(PyRunnerError::PyError),
+                None => receiver
+                    .recv()
+                    .map_err(|_| PyRunnerError::ReceiveResultFailed)?
+                    .map_err(PyRunnerError::PyError),
+            }
         };
 
         if Handle::try_current().is_ok() {
@@ -168,7 +264,12 @@ impl PyRunner {
             thread::spawn(move || {
                 let _ = tx.send(send_and_receive());
             });
-            rx.recv().map_err(|_| PyRunnerError::ReceiveResultFailed)?
+            match timeout {
+                Some(duration) => rx
+                    .recv_timeout(duration)
+                    .map_err(|_| PyRunnerError::Timeout)?,
+                None => rx.recv().map_err(|_| PyRunnerError::ReceiveResultFailed)?,
+            }
         } else {
             send_and_receive()
         }
@@ -376,10 +477,12 @@ impl PyRunner {
         } else {
             let version_code = "f\"python{sys.version_info.major}.{sys.version_info.minor}\"";
             let py_version = self.eval(version_code).await?;
-            venv_path
-                .join("lib")
-                .join(py_version.as_str().unwrap())
-                .join("site-packages")
+            let py_version = py_version.as_str().ok_or_else(|| {
+                PyRunnerError::PyError(format!(
+                    "Expected Python version string, got {py_version:?}"
+                ))
+            })?;
+            venv_path.join("lib").join(py_version).join("site-packages")
         };
         #[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
         let with_pth = "True";
@@ -417,10 +520,12 @@ impl PyRunner {
         } else {
             let version_code = "f\"python{sys.version_info.major}.{sys.version_info.minor}\"";
             let py_version = self.eval_sync(version_code)?;
-            venv_path
-                .join("lib")
-                .join(py_version.as_str().unwrap())
-                .join("site-packages")
+            let py_version = py_version.as_str().ok_or_else(|| {
+                PyRunnerError::PyError(format!(
+                    "Expected Python version string, got {py_version:?}"
+                ))
+            })?;
+            venv_path.join("lib").join(py_version).join("site-packages")
         };
         #[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
         let with_pth = "True";
@@ -630,6 +735,34 @@ async def add(a, b):
         assert!(matches!(result, Err(PyRunnerError::SendCommandFailed)));
     }
 
+    #[tokio::test]
+    async fn test_async_call_times_out_without_leaking_caller() {
+        let runner = PyRunner::new().with_timeout(Duration::from_millis(50));
+
+        let result = runner.run("import time; time.sleep(0.3)").await;
+        assert!(matches!(result, Err(PyRunnerError::Timeout)));
+
+        // The slow command is still occupying the dedicated thread; give it time
+        // to finish so the next command isn't still queued behind it.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let result = runner.eval("1 + 1").await.unwrap();
+        assert_eq!(result, Value::Number(2.into()));
+    }
+
+    #[test]
+    fn test_sync_call_times_out_without_leaking_caller() {
+        let runner = PyRunner::new().with_timeout(Duration::from_millis(50));
+
+        let result = runner.run_sync("import time; time.sleep(0.3)");
+        assert!(matches!(result, Err(PyRunnerError::Timeout)));
+
+        thread::sleep(Duration::from_secs(1));
+
+        let result = runner.eval_sync("1 + 1").unwrap();
+        assert_eq!(result, Value::Number(2.into()));
+    }
+
     #[cfg(feature = "rustpython")]
     #[tokio::test]
     async fn test_rustpython_async_function_reports_unsupported() {
@@ -815,5 +948,112 @@ result = mymodule.my_func()
         assert_eq!(final_x, Value::Number(10.into()));
 
         runner.stop_sync().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_deep_recursion_does_not_crash_process() {
+        // Regression guard for the SIGILL-on-aarch64 class of bug: RustPython's
+        // tree-walking interpreter uses far more native stack per Python call
+        // frame than CPython, especially in debug builds, so a worker thread
+        // with too small a stack can overflow well before Python's own
+        // recursion limit fires. A native stack overflow corrupts the stack and
+        // crashes the *whole test process* instead of returning a `Result`, so
+        // a reverted fix shows up as the test binary aborting, not as a normal
+        // assertion failure.
+        let runner = PyRunner::new();
+        let code = r#"
+def recurse(n):
+    if n <= 0:
+        return 0
+    return 1 + recurse(n - 1)
+
+result = recurse(2000)
+"#;
+        // Either a clean success or a clean Python-level error (e.g. hitting
+        // the interpreter's own recursion limit) is fine; what matters is that
+        // the process is still alive to observe either outcome.
+        let _ = runner.run(code).await;
+
+        // The runner must still be usable afterwards.
+        let echo = runner.eval("1 + 1").await.unwrap();
+        assert_eq!(echo, Value::Number(2.into()));
+    }
+
+    #[tokio::test]
+    async fn test_channel_backpressure_does_not_hang() {
+        // Regression guard for the "stuck call wedges the whole runner forever"
+        // class of bug: send more concurrent commands than the bounded
+        // channel's capacity (32) and make sure every one of them completes.
+        // The outer `tokio::time::timeout` turns a regression into a fast,
+        // clear test failure instead of a CI job that hangs forever.
+        let runner = PyRunner::new();
+        runner.run("x = 0").await.unwrap();
+
+        let work = async {
+            let mut handles = Vec::new();
+            for i in 0..64 {
+                let runner_clone = runner.clone();
+                handles.push(tokio::spawn(async move {
+                    runner_clone.run(&format!("x += {}", i)).await.unwrap();
+                }));
+            }
+            for handle in handles {
+                handle.await.unwrap();
+            }
+        };
+
+        tokio::time::timeout(Duration::from_secs(20), work)
+            .await
+            .expect("commands beyond the channel capacity should not hang the runner");
+
+        let final_x = runner.read_variable("x").await.unwrap();
+        assert_eq!(final_x, Value::Number((0..64).sum::<i64>().into()));
+    }
+
+    #[tokio::test]
+    async fn test_rapid_concurrent_calls_with_slow_call_do_not_hang() {
+        // Regression guard for the GitHub-reported "API hanging" bug
+        // (marcomq/tauri-plugin-python#15): a single slow/stuck Python call
+        // followed by rapid concurrent calls (simulating a user clicking a
+        // button repeatedly) must not leave any caller blocked forever, even
+        // though the slow call itself still occupies the one dedicated worker
+        // thread until it finishes.
+        let base_runner = PyRunner::new();
+        let runner = base_runner.clone().with_timeout(Duration::from_millis(200));
+
+        // Kick off one slow call without waiting for it - simulates a stuck
+        // call, e.g. a `requests.get()` whose own timeout doesn't fire. Uses
+        // the un-timed-out clone so this await reflects how long the worker
+        // thread actually stays occupied, not how long the caller gives up
+        // waiting.
+        let slow_handle = tokio::spawn(async move {
+            let _ = base_runner.run("import time; time.sleep(1)").await;
+        });
+
+        // "Rapid clicking": fire several concurrent calls while the slow call
+        // is still occupying the dedicated thread.
+        let work = async {
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let runner_clone = runner.clone();
+                handles.push(tokio::spawn(
+                    async move { runner_clone.eval("1 + 1").await },
+                ));
+            }
+            for handle in handles {
+                // Every caller must resolve - with a timely `Timeout` or a real
+                // result - rather than hang forever.
+                let _ = handle.await.unwrap();
+            }
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), work)
+            .await
+            .expect("rapid concurrent calls must not hang while a slow call is in flight");
+
+        slow_handle.await.unwrap();
+
+        // The runner must still be usable afterwards.
+        assert_eq!(runner.eval("1 + 1").await.unwrap(), Value::Number(2.into()));
     }
 }

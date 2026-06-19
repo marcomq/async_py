@@ -12,7 +12,8 @@ use pyo3::{
 };
 use serde_json::Value;
 use std::ffi::CString;
-use tokio::sync::{mpsc, oneshot};
+use std::sync::mpsc as std_mpsc;
+use tokio::sync::mpsc;
 
 fn python_code_to_cstring(code: String) -> PyResult<CString> {
     CString::new(code).map_err(|err| {
@@ -164,7 +165,7 @@ fn vec_to_py_tuple<'py>(
 async fn handle_call_async_function(
     func: Py<PyAny>,
     args: Vec<Value>,
-    responder: oneshot::Sender<Result<Value, String>>,
+    responder: std_mpsc::Sender<Result<Value, String>>,
 ) {
     let result = Python::attach(|py| {
         let func = func.bind(py);
