@@ -7,9 +7,13 @@
 
 #[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
 mod pyo3_runner;
+#[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
+mod python_home;
 #[cfg(feature = "rustpython")]
 mod rustpython_runner;
 
+#[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
+pub use python_home::{init_python_home, is_python_home};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;

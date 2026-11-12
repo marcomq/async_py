@@ -145,6 +145,70 @@ results = {
     );
 }
 
+/// Pure-Python stdlib modules embedded into the binary for RustPython.
+#[cfg(feature = "rustpython")]
+const RUSTPYTHON_STDLIB_MODULES: &[&str] = &[
+    "json",
+    "re",
+    "collections",
+    "dataclasses",
+    "enum",
+    "typing",
+    "inspect",
+    "datetime",
+    "decimal",
+    "fractions",
+    "random",
+    "base64",
+    "os",
+    "pathlib",
+    "io",
+    "csv",
+    "copy",
+    "logging",
+    "threading",
+    "asyncio",
+    "urllib.parse",
+    "email",
+];
+
+#[cfg(feature = "rustpython")]
+#[tokio::test]
+async fn rustpython_stdlib_modules_import() {
+    assert_all_import(RUSTPYTHON_STDLIB_MODULES).await;
+}
+
+/// The stdlib is frozen into the binary, so it neither depends on nor picks up
+/// a (version-incompatible) CPython install of the host.
+#[cfg(feature = "rustpython")]
+#[tokio::test]
+async fn rustpython_stdlib_is_embedded() {
+    let runner = PyRunner::new();
+    runner
+        .run(
+            r#"
+import json, typing, codecs
+results = {
+    "origin": json.__spec__.origin,
+    "typing_origin": typing.__spec__.origin,
+    "latin1": "\u00e4".encode("latin-1").hex(),
+    "cp1252": codecs.lookup("cp1252").name,
+}
+"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        runner.read_variable("results").await.unwrap(),
+        json!({
+            "origin": "frozen",
+            "typing_origin": "frozen",
+            "latin1": "e4",
+            "cp1252": "cp1252",
+        })
+    );
+}
+
 async fn site_packages_for(runner: &PyRunner, venv: &std::path::Path) -> std::path::PathBuf {
     if cfg!(target_os = "windows") {
         return venv.join("Lib").join("site-packages");

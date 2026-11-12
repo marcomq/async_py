@@ -27,6 +27,9 @@ fn python_code_to_cstring(code: String) -> PyResult<CString> {
 /// The main loop for the Python thread. This function is spawned in a new
 /// thread and is responsible for all Python interaction.
 pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
+    if let Some(msg) = crate::python_home::init_failure() {
+        return reject_all_commands(receiver, msg).await;
+    }
     Python::initialize();
     let mut globals = Python::attach(|py| PyDict::new(py).unbind());
     while let Some(mut cmd) = receiver.recv().await {
@@ -87,6 +90,20 @@ pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) 
         }
         // After the loop, we can send a final confirmation for the Stop command if needed,
         // but the current implementation in lib.rs handles the channel closing.
+    }
+}
+
+/// Answers every command with `msg` when CPython failed to initialize.
+async fn reject_all_commands(mut receiver: mpsc::Receiver<PyCommand>, msg: String) {
+    while let Some(cmd) = receiver.recv().await {
+        let response = match cmd.cmd_type {
+            CmdType::Stop => {
+                receiver.close();
+                Ok(Value::Null)
+            }
+            _ => Err(msg.clone()),
+        };
+        let _ = cmd.responder.send(response);
     }
 }
 
