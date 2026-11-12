@@ -35,9 +35,24 @@ use tokio::sync::mpsc;
 /// physical memory, since pages are only committed as the stack actually grows.
 const WORKER_STACK_SIZE: usize = 64 * 1024 * 1024;
 
+/// Maximum nesting depth when converting a Python value to `serde_json::Value`.
+///
+/// Guards against circular references (e.g. a list containing itself), which
+/// would otherwise overflow the native stack and abort the whole process.
+#[cfg(any(feature = "pyo3", feature = "rustpython"))]
+pub(crate) const MAX_VALUE_DEPTH: usize = 512;
+
+#[cfg(any(feature = "pyo3", feature = "rustpython"))]
+pub(crate) fn value_too_deep_message() -> String {
+    format!(
+        "Python value is nested deeper than {MAX_VALUE_DEPTH} levels and cannot be converted (circular reference?)"
+    )
+}
+
 #[derive(Debug)]
 pub(crate) enum CmdType {
     RunFile(PathBuf),
+    RunModule(String),
     RunCode(String),
     EvalCode(String),
     ReadVariable(String),
@@ -136,7 +151,12 @@ impl PyRunner {
                 #[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
                 {
                     use tokio::runtime::Builder;
-                    let rt = Builder::new_multi_thread().enable_all().build().unwrap();
+                    // Async results are converted on worker threads, so they need the same stack.
+                    let rt = Builder::new_multi_thread()
+                        .thread_stack_size(WORKER_STACK_SIZE)
+                        .enable_all()
+                        .build()
+                        .unwrap();
                     rt.block_on(pyo3_runner::python_thread_main(receiver));
                 }
 
@@ -321,6 +341,44 @@ impl PyRunner {
             .map(|_| ())
     }
 
+    /// Asynchronously imports a Python module and uses its namespace as the
+    /// runner's global scope.
+    ///
+    /// * `module`: Dotted module name, e.g. `"my_app"` or `"my_app.backend"`.
+    ///
+    /// The module is loaded through Python's regular import system, so it must be
+    /// importable from `sys.path` (see `set_venv`, or extend `sys.path` with
+    /// `run`). This allows using compiled entry points such as Cython or
+    /// `nuitka --module` extensions (`.so`/`.pyd`) or `.pyc`-only packages
+    /// without a `.py` stub.
+    ///
+    /// Afterwards `call_function`, `call_async_function`, `read_variable`, `eval` and `run` operate on
+    /// the module's namespace. The previous global scope is replaced, so names
+    /// defined earlier with `run` are no longer visible. Importing a module that
+    /// was already imported reuses the cached module and does not re-execute it.
+    ///
+    /// With the RustPython backend only pure Python modules (`.py`/`.pyc`) can be
+    /// loaded; CPython extension modules are not supported.
+    pub async fn run_module(&self, module: &str) -> Result<(), PyRunnerError> {
+        self.send_command(CmdType::RunModule(module.into()))
+            .await
+            .map(|_| ())
+    }
+
+    /// Synchronously imports a Python module and uses its namespace as the
+    /// runner's global scope.
+    ///
+    /// This is a blocking wrapper around `run_module`. It is intended for use in
+    /// synchronous applications.
+    ///
+    /// * `module`: Dotted module name, e.g. `"my_app"` or `"my_app.backend"`.
+    ///
+    /// **Note:** This function is safe to call from any context (sync or async).
+    pub fn run_module_sync(&self, module: &str) -> Result<(), PyRunnerError> {
+        self.send_command_sync(CmdType::RunModule(module.into()))
+            .map(|_| ())
+    }
+
     /// Asynchronously evaluates a single Python expression.
     ///
     /// * `code`: A string slice containing the Python expression to evaluate. Must not contain definitions or multiple lines.
@@ -373,6 +431,7 @@ impl PyRunner {
     /// * `args`: A vector of `serde_json::Value` to pass as arguments to the function.
     ///
     /// Returns the function's return value as a `serde_json::Value` on success.
+    /// Returns a `PyError` if the result is awaitable; use `call_async_function` for those.
     /// Does not release GIL during await.
     pub async fn call_function(
         &self,
@@ -408,6 +467,9 @@ impl PyRunner {
     /// * `name`: The name of the function to call. It can be a dot-separated path
     ///   to access functions within modules (e.g., "my_module.my_function").
     /// * `args`: A vector of `serde_json::Value` to pass as arguments to the function.
+    ///
+    /// The function may return a coroutine, an `asyncio.Future`/`Task` or a
+    /// `concurrent.futures.Future`; the result is awaited before it is returned.
     ///
     /// Returns the function's return value as a `serde_json::Value` on success.
     /// Will release GIL during await.
@@ -737,14 +799,13 @@ async def add(a, b):
 
     #[tokio::test]
     async fn test_async_call_times_out_without_leaking_caller() {
-        let runner = PyRunner::new().with_timeout(Duration::from_millis(50));
+        let runner = PyRunner::new();
+        // Interpreter startup can take longer than the timeout on slow CI runners.
+        runner.eval("0").await.unwrap();
+        let timed = runner.clone().with_timeout(Duration::from_millis(50));
 
-        let result = runner.run("import time; time.sleep(0.3)").await;
+        let result = timed.run("import time; time.sleep(0.3)").await;
         assert!(matches!(result, Err(PyRunnerError::Timeout)));
-
-        // The slow command is still occupying the dedicated thread; give it time
-        // to finish so the next command isn't still queued behind it.
-        tokio::time::sleep(Duration::from_secs(1)).await;
 
         let result = runner.eval("1 + 1").await.unwrap();
         assert_eq!(result, Value::Number(2.into()));
@@ -752,12 +813,12 @@ async def add(a, b):
 
     #[test]
     fn test_sync_call_times_out_without_leaking_caller() {
-        let runner = PyRunner::new().with_timeout(Duration::from_millis(50));
+        let runner = PyRunner::new();
+        runner.eval_sync("0").unwrap();
+        let timed = runner.clone().with_timeout(Duration::from_millis(50));
 
-        let result = runner.run_sync("import time; time.sleep(0.3)");
+        let result = timed.run_sync("import time; time.sleep(0.3)");
         assert!(matches!(result, Err(PyRunnerError::Timeout)));
-
-        thread::sleep(Duration::from_secs(1));
 
         let result = runner.eval_sync("1 + 1").unwrap();
         assert_eq!(result, Value::Number(2.into()));
