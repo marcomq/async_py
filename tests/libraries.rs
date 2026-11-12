@@ -6,6 +6,7 @@ use common::*;
 use serde_json::json;
 
 /// Native modules that RustPython ships without needing a Python stdlib directory.
+/// `array` is excluded: RustPython's native `array` imports `collections.abc` on load.
 const NATIVE_MODULES: &[&str] = &[
     "sys",
     "math",
@@ -13,7 +14,6 @@ const NATIVE_MODULES: &[&str] = &[
     "itertools",
     "binascii",
     "zlib",
-    "array",
     "cmath",
     "unicodedata",
     "_thread",
