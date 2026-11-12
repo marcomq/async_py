@@ -794,14 +794,13 @@ async def add(a, b):
 
     #[tokio::test]
     async fn test_async_call_times_out_without_leaking_caller() {
-        let runner = PyRunner::new().with_timeout(Duration::from_millis(50));
+        let runner = PyRunner::new();
+        // Interpreter startup can take longer than the timeout on slow CI runners.
+        runner.eval("0").await.unwrap();
+        let timed = runner.clone().with_timeout(Duration::from_millis(50));
 
-        let result = runner.run("import time; time.sleep(0.3)").await;
+        let result = timed.run("import time; time.sleep(0.3)").await;
         assert!(matches!(result, Err(PyRunnerError::Timeout)));
-
-        // The slow command is still occupying the dedicated thread; give it time
-        // to finish so the next command isn't still queued behind it.
-        tokio::time::sleep(Duration::from_secs(1)).await;
 
         let result = runner.eval("1 + 1").await.unwrap();
         assert_eq!(result, Value::Number(2.into()));
@@ -809,12 +808,12 @@ async def add(a, b):
 
     #[test]
     fn test_sync_call_times_out_without_leaking_caller() {
-        let runner = PyRunner::new().with_timeout(Duration::from_millis(50));
+        let runner = PyRunner::new();
+        runner.eval_sync("0").unwrap();
+        let timed = runner.clone().with_timeout(Duration::from_millis(50));
 
-        let result = runner.run_sync("import time; time.sleep(0.3)");
+        let result = timed.run_sync("import time; time.sleep(0.3)");
         assert!(matches!(result, Err(PyRunnerError::Timeout)));
-
-        thread::sleep(Duration::from_secs(1));
 
         let result = runner.eval_sync("1 + 1").unwrap();
         assert_eq!(result, Value::Number(2.into()));
