@@ -3,9 +3,12 @@
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/async_py
 
-use crate::{print_path_for_python, CmdType, PyCommand};
+use crate::{print_path_for_python, value_too_deep_message, CmdType, PyCommand, MAX_VALUE_DEPTH};
 use rustpython_vm::{
-    builtins::{PyBaseException, PyBool, PyDict, PyFloat, PyInt, PyList, PyStr},
+    builtins::{
+        PyBaseException, PyBool, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyStr,
+        PyTuple,
+    },
     convert::ToPyObject,
     eval,
     scope::Scope,
@@ -24,7 +27,7 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
     let interp = builder.add_native_modules(&stdlib_modules).build();
 
     interp.enter(|vm| {
-        let scope = vm.new_scope_with_builtins();
+        let mut scope = vm.new_scope_with_builtins();
         vm.run_string(
             scope.clone(),
             "import sys; sys.path.append('./')",
@@ -59,11 +62,16 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
                     (None, _) => Err(vm.new_value_error("file path has no parent".to_owned())),
                     (_, None) => Err(vm.new_value_error("file path must be UTF-8".to_owned())),
                 },
+                CmdType::RunModule(module) => import_module(vm, module).map(|module_scope| {
+                    scope = module_scope;
+                    Value::Null
+                }),
                 CmdType::ReadVariable(var_name) => {
                     read_variable(vm, scope.clone(), var_name).and_then(|obj| py_to_json(vm, &obj))
                 }
                 CmdType::CallFunction { name, args } => {
                     call_function(vm, scope.clone(), name, args.clone())
+                        .and_then(|obj| reject_awaitable(vm, obj, name))
                         .and_then(|obj| py_to_json(vm, &obj))
                 }
                 CmdType::CallAsyncFunction { name, args } => {
@@ -89,6 +97,17 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
     });
 }
 
+/// Imports `name` and returns a scope backed by the module's namespace.
+/// `vm.import` returns the top-level package, so the module is taken from `sys.modules`.
+fn import_module(vm: &VirtualMachine, name: &str) -> PyResult<Scope> {
+    vm.import(&vm.ctx.new_str(name), 0)?;
+    let module = vm.sys_module.get_attr("modules", vm)?.get_item(name, vm)?;
+    let globals = module
+        .dict()
+        .ok_or_else(|| vm.new_type_error(format!("module '{name}' has no __dict__")))?;
+    Ok(Scope::with_builtins(None, globals, vm))
+}
+
 fn read_variable(vm: &VirtualMachine, scope: Scope, var_name: &str) -> PyResult<PyObjectRef> {
     let parts: Vec<String> = var_name.split('.').map(|s| s.to_owned()).collect();
     let mut obj = scope.globals.get_item(&parts[0], vm)?;
@@ -105,6 +124,18 @@ fn call_function(vm: &VirtualMachine, scope: Scope, name: &str, args: Vec<Value>
         .map(|v| json_to_py(vm, v))
         .collect::<PyResult<Vec<_>>>()?;
     func.call(py_args, vm)
+}
+
+fn reject_awaitable(vm: &VirtualMachine, obj: PyObjectRef, name: &str) -> PyResult {
+    if vm
+        .get_attribute_opt(obj.class().to_owned().into(), "__await__")?
+        .is_none()
+    {
+        return Ok(obj);
+    }
+    Err(vm.new_type_error(format!(
+        "'{name}' returned an awaitable; use call_async_function to await it"
+    )))
 }
 
 /// Converts a `serde_json::Value` to a `PyObjectRef`.
@@ -141,6 +172,13 @@ fn json_to_py(vm: &VirtualMachine, val: Value) -> PyResult<PyObjectRef> {
 
 /// Converts a `PyObjectRef` to a `serde_json::Value`.
 fn py_to_json(vm: &VirtualMachine, obj: &PyObjectRef) -> PyResult<Value> {
+    py_to_json_nested(vm, obj, 0)
+}
+
+fn py_to_json_nested(vm: &VirtualMachine, obj: &PyObjectRef, depth: usize) -> PyResult<Value> {
+    if depth > MAX_VALUE_DEPTH {
+        return Err(vm.new_value_error(value_too_deep_message()));
+    }
     if obj.is(&vm.ctx.none()) {
         return Ok(Value::Null);
     }
@@ -168,12 +206,16 @@ fn py_to_json(vm: &VirtualMachine, obj: &PyObjectRef) -> PyResult<Value> {
         return Ok(Value::String(s.to_string_lossy().into_owned()));
     }
     if let Some(list) = obj.downcast_ref::<PyList>() {
-        let vec = list
-            .borrow_vec()
-            .iter()
-            .map(|item| py_to_json(vm, item))
-            .collect::<PyResult<Vec<Value>>>()?;
-        return Ok(Value::Array(vec));
+        return items_to_json(vm, list.borrow_vec().iter(), depth);
+    }
+    if let Some(tuple) = obj.downcast_ref::<PyTuple>() {
+        return items_to_json(vm, tuple.iter(), depth);
+    }
+    if let Some(set) = obj.downcast_ref::<PySet>() {
+        return items_to_json(vm, set.elements().iter(), depth);
+    }
+    if let Some(set) = obj.downcast_ref::<PyFrozenSet>() {
+        return items_to_json(vm, set.elements().iter(), depth);
     }
     if let Some(dict) = obj.downcast_ref::<PyDict>() {
         let mut map = Map::new();
@@ -183,7 +225,7 @@ fn py_to_json(vm: &VirtualMachine, obj: &PyObjectRef) -> PyResult<Value> {
                 .ok_or_else(|| vm.new_type_error("dict keys must be strings".to_owned()))?
                 .to_string_lossy()
                 .into_owned();
-            map.insert(key_str, py_to_json(vm, &value)?);
+            map.insert(key_str, py_to_json_nested(vm, &value, depth + 1)?);
         }
         return Ok(Value::Object(map));
     }
@@ -204,6 +246,17 @@ fn py_to_json(vm: &VirtualMachine, obj: &PyObjectRef) -> PyResult<Value> {
 
     let fallback = obj.str(vm)?;
     Ok(Value::String(fallback.to_string()))
+}
+
+fn items_to_json<'a>(
+    vm: &VirtualMachine,
+    items: impl Iterator<Item = &'a PyObjectRef>,
+    depth: usize,
+) -> PyResult<Value> {
+    items
+        .map(|item| py_to_json_nested(vm, item, depth + 1))
+        .collect::<PyResult<Vec<_>>>()
+        .map(Value::Array)
 }
 
 fn print_err_msg(vm: &VirtualMachine, error: PyRef<PyBaseException>) -> String {

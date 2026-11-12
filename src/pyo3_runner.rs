@@ -3,11 +3,11 @@
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/async_py
 
-use crate::{print_path_for_python, CmdType, PyCommand};
+use crate::{print_path_for_python, value_too_deep_message, CmdType, PyCommand, MAX_VALUE_DEPTH};
 use pyo3::{
-    exceptions::{PyKeyError, PyValueError},
+    exceptions::{PyKeyError, PyTypeError, PyValueError},
     prelude::*,
-    types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString},
+    types::{PyBool, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyString, PyTuple},
     IntoPyObjectExt,
 };
 use serde_json::Value;
@@ -28,8 +28,9 @@ fn python_code_to_cstring(code: String) -> PyResult<CString> {
 /// thread and is responsible for all Python interaction.
 pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
     Python::initialize();
-    let globals = Python::attach(|py| PyDict::new(py).unbind());
+    let mut globals = Python::attach(|py| PyDict::new(py).unbind());
     while let Some(mut cmd) = receiver.recv().await {
+        let mut new_globals = None;
         Python::attach(|py| {
             let globals = globals.bind(py);
             let result = match std::mem::replace(&mut cmd.cmd_type, CmdType::Stop) {
@@ -41,6 +42,10 @@ pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) 
                         .and_then(|obj| py_any_to_json(&obj))
                 }),
                 CmdType::RunFile(file) => handle_run_file(py, globals, file),
+                CmdType::RunModule(module) => py.import(module.as_str()).map(|module| {
+                    new_globals = Some(module.dict().unbind());
+                    Value::Null
+                }),
                 CmdType::ReadVariable(var_name) => {
                     get_py_object(globals, &var_name).and_then(|obj| py_any_to_json(&obj))
                 }
@@ -77,6 +82,9 @@ pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) 
             };
             let _ = cmd.responder.send(response);
         });
+        if let Some(module_globals) = new_globals {
+            globals = module_globals;
+        }
         // After the loop, we can send a final confirmation for the Stop command if needed,
         // but the current implementation in lib.rs handles the channel closing.
     }
@@ -147,7 +155,22 @@ fn handle_call_function(
     check_func_callable(&func, &name)?;
     let t_args = vec_to_py_tuple(&py, args)?;
     let result = func.call1(t_args)?;
+    reject_awaitable(py, &result, &name)?;
     py_any_to_json(&result)
+}
+
+/// Fails instead of returning `str()` of a coroutine or future that was never awaited.
+fn reject_awaitable(py: Python, obj: &Bound<PyAny>, name: &str) -> PyResult<()> {
+    let inspect = py.import("inspect")?;
+    if !inspect.call_method1("isawaitable", (obj,))?.is_truthy()? {
+        return Ok(());
+    }
+    if inspect.call_method1("iscoroutine", (obj,))?.is_truthy()? {
+        obj.call_method0("close")?;
+    }
+    Err(PyErr::new::<PyTypeError, _>(format!(
+        "'{name}' returned an awaitable; use call_async_function to await it"
+    )))
 }
 
 fn vec_to_py_tuple<'py>(
@@ -168,10 +191,6 @@ async fn handle_call_async_function(
     responder: std_mpsc::Sender<Result<Value, String>>,
 ) {
     let result = Python::attach(|py| {
-        let func = func.bind(py);
-        let t_args = vec_to_py_tuple(&py, args)?;
-        let coroutine = func.call1(t_args)?;
-
         let asyncio = py.import("asyncio")?; // py.import_bound("asyncio")? in newer pyo3
         let loop_obj = match asyncio.call_method0("get_running_loop") {
             Ok(loop_obj) => loop_obj,
@@ -183,15 +202,38 @@ async fn handle_call_async_function(
             }
         };
 
-        let result = loop_obj.call_method1("run_until_complete", (coroutine,))?;
+        // Called after the loop is set, so futures created by `func` bind to this loop.
+        let t_args = vec_to_py_tuple(&py, args)?;
+        let awaitable = wrap_concurrent_future(py, &asyncio, func.bind(py).call1(t_args)?)?;
+        let result = loop_obj.call_method1("run_until_complete", (awaitable,))?;
 
         py_any_to_json(&result)
     });
     let _ = responder.send(result.map_err(|e| e.to_string()));
 }
 
+fn wrap_concurrent_future<'py>(
+    py: Python<'py>,
+    asyncio: &Bound<'py, PyModule>,
+    obj: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let future_type = py.import("concurrent.futures")?.getattr("Future")?;
+    if obj.is_instance(&future_type)? {
+        asyncio.call_method1("wrap_future", (obj,))
+    } else {
+        Ok(obj)
+    }
+}
+
 /// Recursively converts a Python object to a `serde_json::Value`.
 fn py_any_to_json(obj: &pyo3::Bound<'_, PyAny>) -> PyResult<Value> {
+    py_any_to_json_nested(obj, 0)
+}
+
+fn py_any_to_json_nested(obj: &pyo3::Bound<'_, PyAny>, depth: usize) -> PyResult<Value> {
+    if depth > MAX_VALUE_DEPTH {
+        return Err(PyErr::new::<PyValueError, _>(value_too_deep_message()));
+    }
     if obj.is_none() {
         return Ok(Value::Null);
     }
@@ -215,19 +257,37 @@ fn py_any_to_json(obj: &pyo3::Bound<'_, PyAny>) -> PyResult<Value> {
         return Ok(Value::String(s.to_string()));
     }
     if let Ok(list) = obj.cast::<PyList>() {
-        let items: PyResult<Vec<Value>> = list.iter().map(|item| py_any_to_json(&item)).collect();
-        return Ok(Value::Array(items?));
+        return items_to_json(list.iter(), depth);
+    }
+    if let Ok(tuple) = obj.cast::<PyTuple>() {
+        return items_to_json(tuple.iter(), depth);
+    }
+    if let Ok(set) = obj.cast::<PySet>() {
+        return items_to_json(set.iter(), depth);
+    }
+    if let Ok(set) = obj.cast::<PyFrozenSet>() {
+        return items_to_json(set.iter(), depth);
     }
     if let Ok(dict) = obj.cast::<PyDict>() {
         let mut map = serde_json::Map::new();
         for (key, value) in dict.iter() {
-            map.insert(key.to_string(), py_any_to_json(&value)?);
+            map.insert(key.to_string(), py_any_to_json_nested(&value, depth + 1)?);
         }
         return Ok(Value::Object(map));
     }
 
     // Fallback for other types: convert to string representation
     Ok(Value::String(obj.to_string()))
+}
+
+fn items_to_json<'py>(
+    items: impl Iterator<Item = Bound<'py, PyAny>>,
+    depth: usize,
+) -> PyResult<Value> {
+    items
+        .map(|item| py_any_to_json_nested(&item, depth + 1))
+        .collect::<PyResult<Vec<_>>>()
+        .map(Value::Array)
 }
 
 /// Converts a serde_json::Value to a Python object.

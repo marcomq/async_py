@@ -19,7 +19,7 @@ Add `async_py` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-async_py = "0.3"
+async_py = "0.4"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 ```
@@ -57,8 +57,14 @@ def greet(name):
 
 `PyRunner` can call regular Python functions with `call_function` and Python
 coroutines with `call_async_function`. Use the async call for functions declared
-with `async def`; calling them through `call_function` will return the coroutine
-object instead of awaiting it.
+with `async def`; calling them through `call_function` returns a `PyError`
+instead of the un-awaited coroutine.
+
+`call_async_function` awaits whatever the function returns: a coroutine, an
+`asyncio.Future`/`Task` (e.g. from `asyncio.ensure_future`), or a
+`concurrent.futures.Future` (e.g. from `ThreadPoolExecutor.submit`). The event
+loop is set before the function is called, so futures it creates via
+`asyncio.get_event_loop()` belong to the loop that awaits them.
 
 The Python interpreter still runs on one dedicated worker thread. Normal CPU-bound
 Python code is serialized by that worker and by the Python GIL. Python coroutines
@@ -186,6 +192,59 @@ uv sync
 
 Then call `set_venv(".venv")` before importing those packages. If you configure
 `uv` to use a different project environment path, pass that path instead.
+
+### Using a module as entry point
+
+Instead of executing a `.py` file with `run_file`, you can import a module and use
+its namespace as the runner's global scope with `run_module`:
+
+```rust
+use async_py::PyRunner;
+use std::path::Path;
+
+# async fn example() -> Result<(), async_py::PyRunnerError> {
+let runner = PyRunner::new();
+runner.set_venv(Path::new(".venv")).await?;
+runner.run_module("my_app.backend").await?;
+let reply = runner.call_function("handle", vec!["ping".into()]).await?;
+# Ok(())
+# }
+```
+
+The module is loaded through Python's normal import system, so it must be on
+`sys.path` (for example installed into the venv, or added with
+`runner.run("import sys; sys.path.insert(0, '...')")`). This makes it possible to
+use compiled entry points directly, such as Cython or `nuitka --module` extensions
+(`.so`/`.pyd`) or `.pyc`-only packages, without a `.py` stub.
+
+- `call_function`, `call_async_function`, `read_variable`, `eval` and `run` then
+  operate on the module's namespace. Changes made by the module's own functions
+  (e.g. via `global`) are visible to `read_variable`.
+- The previous global scope is replaced; names defined earlier with `run` are no
+  longer visible. If the import fails, the previous scope is kept.
+- A module that was already imported is reused from `sys.modules` and not
+  executed again.
+- With the RustPython backend only pure Python modules can be loaded; CPython
+  extension modules (`.so`/`.pyd`) are not supported.
+
+### Value conversion
+
+Arguments and results are exchanged as `serde_json::Value`:
+
+| Python                         | `serde_json::Value`           |
+|--------------------------------|-------------------------------|
+| `None`                         | `Null`                        |
+| `bool`                         | `Bool`                        |
+| `int` (fits in `i64`), `float` | `Number`                      |
+| `str`                          | `String`                      |
+| `list`, `tuple`, `set`, `frozenset` | `Array`                  |
+| `dict`                         | `Object`                      |
+| anything else                  | `String` with the object's `str()` |
+
+Subclasses (e.g. `IntEnum`, `OrderedDict`, named tuples) convert like their base
+type. Sets have no defined order. Bytes are returned as their `str()`. Values nested deeper than 512 levels, including circular
+references such as a list that contains itself, are reported as a `PyError`
+instead of being converted.
 
 ### rustpython
 PyO3 has usually the best compatibility for python packages.
