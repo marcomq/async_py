@@ -246,16 +246,50 @@ type. Sets have no defined order. Bytes are returned as their `str()`. Values ne
 references such as a list that contains itself, are reported as a `PyError`
 instead of being converted.
 
+### Shipping a bundled Python (PyO3)
+
+With PyO3 the binary links the `libpython` found at build time. To ship an
+application that doesn't depend on a Python installed on the target machine,
+bundle a relocatable interpreter such as
+[python-build-standalone](https://github.com/astral-sh/python-build-standalone)
+and tell CPython where it is before the first `PyRunner` is created:
+
+```rust,no_run
+use async_py::{init_python_home, is_python_home, PyRunner};
+use std::path::Path;
+
+# async fn example() -> Result<(), async_py::PyRunnerError> {
+let home = Path::new("resources/python");
+if is_python_home(home) {
+    init_python_home(home)?;
+}
+let runner = PyRunner::new();
+# Ok(())
+# }
+```
+
+Without this, a relocated CPython can't find its stdlib, because it derives
+`sys.prefix` from its executable or its build prefix. `init_python_home` returns
+`Ok(false)` if Python was already initialized. The binary must also find
+`libpython` at runtime, e.g. via an rpath (`@executable_path/...` on macOS,
+`$ORIGIN/...` on Linux) or by placing `python3XX.dll` next to the executable on
+Windows.
+
 ### rustpython
 PyO3 has usually the best compatibility for python packages.
 But if you want to use python on android, wasm, or if you don't want to use any
 external library, you can use [rustpython](https://github.com/RustPython/RustPython).
-Keep in mind that some essential packages like `os` are missing on rustpython.
+
+The pure-Python part of the stdlib (`json`, `typing`, `asyncio`, `dataclasses`,
+`pathlib`, `logging`, ...) is compiled into the binary, so no Python
+installation is needed or used. Modules that need CPython C extensions, such as
+`sqlite3` or `ssl`, as well as third-party C extension packages, are not
+available. `call_async_function` is not supported yet.
 
 Cargo.toml
 ```toml
 [dependencies]
-async_py = { features = ["rustpython"] } 
+async_py = { version = "0.4", default-features = false, features = ["rustpython"] }
 ```
 
 ### Comparison with inline-python

@@ -23,7 +23,10 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
     settings.path_list.push("Lib".to_owned());
     let builder = Interpreter::builder(settings);
     let stdlib_modules = rustpython_stdlib::stdlib_module_defs(&builder.ctx);
-    let interp = builder.add_native_modules(&stdlib_modules).build();
+    let interp = builder
+        .add_native_modules(&stdlib_modules)
+        .add_frozen_modules(rustpython_pylib::FROZEN_STDLIB)
+        .build();
 
     interp.enter(|vm| {
         let mut scope = vm.new_scope_with_builtins();
