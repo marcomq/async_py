@@ -254,18 +254,17 @@ bundle a relocatable interpreter such as
 [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
 and tell CPython where it is before the first `PyRunner` is created:
 
-```rust,no_run
-use async_py::{init_python_home, is_python_home, PyRunner};
+```rust
+use async_py::{init_python_home, is_python_home, PyRunner, PyRunnerError};
 use std::path::Path;
 
-# async fn example() -> Result<(), async_py::PyRunnerError> {
-let home = Path::new("resources/python");
-if is_python_home(home) {
-    init_python_home(home)?;
+async fn start_runner() -> Result<PyRunner, PyRunnerError> {
+    let home = Path::new("resources/python");
+    if is_python_home(home) {
+        init_python_home(home)?;
+    }
+    Ok(PyRunner::new())
 }
-let runner = PyRunner::new();
-# Ok(())
-# }
 ```
 
 Without this, a relocated CPython can't find its stdlib, because it derives
@@ -290,6 +289,14 @@ Cargo.toml
 ```toml
 [dependencies]
 async_py = { version = "0.4", default-features = false, features = ["rustpython"] }
+```
+
+`rustpython-stdlib` 0.5 pulls in `malachite-bigint` twice (0.9 directly and 0.14
+via `pymath`) on a fresh lockfile, which fails to compile with type mismatches.
+Pin the second copy to 0.9.2 once after adding the dependency:
+
+```sh
+cargo update -p malachite-bigint@0.14.0 --precise 0.9.2
 ```
 
 ### Comparison with inline-python

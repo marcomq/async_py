@@ -13,7 +13,22 @@
 
 use crate::PyRunnerError;
 use pyo3::ffi;
-use std::{ffi::CStr, path::Path};
+use std::{
+    ffi::CStr,
+    path::Path,
+    sync::{Mutex, PoisonError},
+};
+
+/// Error of a failed `Py_InitializeFromConfig`. CPython can't be cleaned up or
+/// initialized again after that, so it is terminal for the process.
+static INIT_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+
+pub(crate) fn init_failure() -> Option<String> {
+    INIT_FAILURE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
 
 /// Returns whether `dir` looks like a Python installation root, i.e. contains
 /// the stdlib (`lib/python3.X/os.py` on Unix, `Lib/os.py` on Windows).
@@ -37,9 +52,13 @@ pub fn is_python_home(dir: &Path) -> bool {
 /// # Errors
 ///
 /// Returns [`PyRunnerError::PyError`] if CPython can't start with that home,
-/// e.g. because the stdlib is missing.
+/// e.g. because the stdlib is missing. Such a failure is permanent: later calls
+/// and every `PyRunner` command return the same error.
 pub fn init_python_home(home: &Path) -> Result<bool, PyRunnerError> {
-    let wide_home = to_wide(home);
+    let mut failure = INIT_FAILURE.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(msg) = failure.as_ref() {
+        return Err(PyRunnerError::PyError(msg.clone()));
+    }
     // SAFETY: plain CPython initialization sequence on a zeroed config that is
     // initialized by `PyConfig_InitPythonConfig` and cleared afterwards; the GIL
     // is released at the end so the runner's worker thread can attach.
@@ -50,23 +69,30 @@ pub fn init_python_home(home: &Path) -> Result<bool, PyRunnerError> {
         let mut config: ffi::PyConfig = std::mem::zeroed();
         ffi::PyConfig_InitPythonConfig(&mut config);
         config.install_signal_handlers = 0;
-        let status =
-            ffi::PyConfig_SetString(&mut config, &mut config.home, wide_home.as_ptr().cast());
+        let status = match set_home(&mut config, home) {
+            Ok(status) => status,
+            Err(err) => {
+                ffi::PyConfig_Clear(&mut config);
+                return Err(err);
+            }
+        };
         if ffi::PyStatus_Exception(status) != 0 {
             ffi::PyConfig_Clear(&mut config);
-            return Err(status_error(status));
+            return Err(PyRunnerError::PyError(status_message(status)));
         }
         let status = ffi::Py_InitializeFromConfig(&config);
         ffi::PyConfig_Clear(&mut config);
         if ffi::PyStatus_Exception(status) != 0 {
-            return Err(status_error(status));
+            let msg = status_message(status);
+            *failure = Some(msg.clone());
+            return Err(PyRunnerError::PyError(msg));
         }
         ffi::PyEval_SaveThread();
     }
     Ok(true)
 }
 
-fn status_error(status: ffi::PyStatus) -> PyRunnerError {
+fn status_message(status: ffi::PyStatus) -> String {
     let msg = if status.err_msg.is_null() {
         "unknown error".into()
     } else {
@@ -75,20 +101,36 @@ fn status_error(status: ffi::PyStatus) -> PyRunnerError {
             .to_string_lossy()
             .into_owned()
     };
-    PyRunnerError::PyError(format!("Cannot initialize Python with home: {msg}"))
+    format!("Cannot initialize Python with home: {msg}")
 }
 
 #[cfg(windows)]
-fn to_wide(path: &Path) -> Vec<u16> {
+unsafe fn set_home(
+    config: &mut ffi::PyConfig,
+    home: &Path,
+) -> Result<ffi::PyStatus, PyRunnerError> {
     use std::os::windows::ffi::OsStrExt;
-    path.as_os_str().encode_wide().chain(Some(0)).collect()
+    let wide: Vec<u16> = home.as_os_str().encode_wide().chain(Some(0)).collect();
+    Ok(ffi::PyConfig_SetString(
+        config,
+        &mut config.home,
+        wide.as_ptr().cast(),
+    ))
 }
 
+/// Passes the raw path bytes, which CPython decodes like `os.fsdecode`, so
+/// non-UTF-8 paths survive unchanged.
 #[cfg(not(windows))]
-fn to_wide(path: &Path) -> Vec<u32> {
-    path.to_string_lossy()
-        .chars()
-        .map(u32::from)
-        .chain(Some(0))
-        .collect()
+unsafe fn set_home(
+    config: &mut ffi::PyConfig,
+    home: &Path,
+) -> Result<ffi::PyStatus, PyRunnerError> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = std::ffi::CString::new(home.as_os_str().as_bytes())
+        .map_err(|_| PyRunnerError::PyError("Python home path contains a NUL byte".into()))?;
+    Ok(ffi::PyConfig_SetBytesString(
+        config,
+        &mut config.home,
+        bytes.as_ptr(),
+    ))
 }

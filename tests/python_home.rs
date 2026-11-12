@@ -89,4 +89,12 @@ fn child_init_with_bad_home_fails() {
     let home = PathBuf::from(std::env::var_os(HOME_ENV).unwrap());
     let err = init_python_home(&home).unwrap_err().to_string();
     assert!(err.contains("Cannot initialize Python with home"), "{err}");
+    let retry = init_python_home(&home).unwrap_err().to_string();
+    assert_eq!(retry, err, "a failed init must not be retried");
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let runner = PyRunner::new();
+        let err = runner.eval("1").await.unwrap_err().to_string();
+        assert!(err.contains("Cannot initialize Python with home"), "{err}");
+        runner.stop().await.unwrap();
+    });
 }
