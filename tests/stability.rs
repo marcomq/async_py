@@ -41,6 +41,34 @@ async fn circular_tuple_reports_error_instead_of_aborting() {
     assert_alive(&runner).await;
 }
 
+const MUTATING_STR: &str = r#"
+class Mutator:
+    def __init__(self, mutate):
+        self.mutate = mutate
+    def __str__(self):
+        self.mutate()
+        return "mutated"
+
+grow_set = set()
+grow_set.add(Mutator(lambda: grow_set.add(object())))
+grow_dict = {}
+grow_dict["a"] = Mutator(lambda: grow_dict.__setitem__("new", 1))
+"#;
+
+#[tokio::test]
+async fn containers_mutated_during_conversion_do_not_kill_runner() {
+    let runner = PyRunner::new();
+    runner.run(MUTATING_STR).await.unwrap();
+
+    assert_eq!(
+        runner.read_variable("grow_set").await.unwrap(),
+        json!(["mutated"])
+    );
+    let dict = runner.read_variable("grow_dict").await.unwrap();
+    assert_eq!(dict["a"], json!("mutated"));
+    assert_alive(&runner).await;
+}
+
 #[tokio::test]
 async fn deeply_nested_but_finite_values_still_convert() {
     let runner = PyRunner::new();

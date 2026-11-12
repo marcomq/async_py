@@ -155,17 +155,16 @@ fn handle_call_function(
     check_func_callable(&func, &name)?;
     let t_args = vec_to_py_tuple(&py, args)?;
     let result = func.call1(t_args)?;
-    reject_awaitable(py, &result, &name)?;
+    reject_awaitable(&result, &name)?;
     py_any_to_json(&result)
 }
 
 /// Fails instead of returning `str()` of a coroutine or future that was never awaited.
-fn reject_awaitable(py: Python, obj: &Bound<PyAny>, name: &str) -> PyResult<()> {
-    let inspect = py.import("inspect")?;
-    if !inspect.call_method1("isawaitable", (obj,))?.is_truthy()? {
+fn reject_awaitable(obj: &Bound<PyAny>, name: &str) -> PyResult<()> {
+    if !obj.get_type().hasattr("__await__")? {
         return Ok(());
     }
-    if inspect.call_method1("iscoroutine", (obj,))?.is_truthy()? {
+    if obj.hasattr("close")? {
         obj.call_method0("close")?;
     }
     Err(PyErr::new::<PyTypeError, _>(format!(
@@ -262,15 +261,15 @@ fn py_any_to_json_nested(obj: &pyo3::Bound<'_, PyAny>, depth: usize) -> PyResult
     if let Ok(tuple) = obj.cast::<PyTuple>() {
         return items_to_json(tuple.iter(), depth);
     }
-    if let Ok(set) = obj.cast::<PySet>() {
-        return items_to_json(set.iter(), depth);
-    }
-    if let Ok(set) = obj.cast::<PyFrozenSet>() {
-        return items_to_json(set.iter(), depth);
+    // Sets and dicts are snapshotted first: `str()` fallbacks may run Python code that
+    // mutates the container, which would make pyo3's iterators panic.
+    if obj.cast::<PySet>().is_ok() || obj.cast::<PyFrozenSet>().is_ok() {
+        let items = obj.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+        return items_to_json(items.into_iter(), depth);
     }
     if let Ok(dict) = obj.cast::<PyDict>() {
         let mut map = serde_json::Map::new();
-        for (key, value) in dict.iter() {
+        for (key, value) in dict.iter().collect::<Vec<_>>() {
             map.insert(key.to_string(), py_any_to_json_nested(&value, depth + 1)?);
         }
         return Ok(Value::Object(map));

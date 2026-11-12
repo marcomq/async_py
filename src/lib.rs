@@ -151,7 +151,12 @@ impl PyRunner {
                 #[cfg(all(feature = "pyo3", not(feature = "rustpython")))]
                 {
                     use tokio::runtime::Builder;
-                    let rt = Builder::new_multi_thread().enable_all().build().unwrap();
+                    // Async results are converted on worker threads, so they need the same stack.
+                    let rt = Builder::new_multi_thread()
+                        .thread_stack_size(WORKER_STACK_SIZE)
+                        .enable_all()
+                        .build()
+                        .unwrap();
                     rt.block_on(pyo3_runner::python_thread_main(receiver));
                 }
 
