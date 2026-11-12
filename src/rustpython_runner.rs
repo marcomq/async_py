@@ -6,8 +6,7 @@
 use crate::{print_path_for_python, value_too_deep_message, CmdType, PyCommand, MAX_VALUE_DEPTH};
 use rustpython_vm::{
     builtins::{
-        PyBaseException, PyBool, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyStr,
-        PyTuple,
+        PyBaseException, PyBool, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyStr, PyTuple,
     },
     convert::ToPyObject,
     eval,
@@ -264,9 +263,9 @@ fn print_err_msg(vm: &VirtualMachine, error: PyRef<PyBaseException>) -> String {
     let msg = if vm.write_exception(&mut rendered, &error).is_ok() {
         rendered.trim().to_owned()
     } else {
-        format!("{:?}", &error)
+        format!("{:?}", error)
     };
-    println!("error: {}", &msg);
+    println!("error: {}", msg);
     if let Some(tb) = error.__traceback__() {
         println!("Traceback (most recent call last):");
         for trace in tb.iter() {
