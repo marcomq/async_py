@@ -246,6 +246,17 @@ type. Sets have no defined order. Bytes are returned as their `str()`. Values ne
 references such as a list that contains itself, are reported as a `PyError`
 instead of being converted.
 
+### Python errors
+
+A Python exception is returned as `PyRunnerError::PyError` with the message
+`Type: message`, e.g. `ValueError: bad input`. To get the full traceback,
+formatted like Python prints an uncaught error, enable it on the runner:
+
+```rust,no_run
+# use async_py::PyRunner;
+let runner = PyRunner::new().with_tracebacks(true);
+```
+
 ### Shipping a bundled Python (PyO3)
 
 With PyO3 the binary links the `libpython` found at build time. To ship an

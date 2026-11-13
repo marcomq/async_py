@@ -65,7 +65,12 @@ pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) 
                     match result {
                         Ok(func) => {
                             py.detach(|| {
-                                tokio::spawn(handle_call_async_function(func, args, cmd.responder))
+                                tokio::spawn(handle_call_async_function(
+                                    func,
+                                    args,
+                                    cmd.tracebacks,
+                                    cmd.responder,
+                                ))
                             });
                             return; // The response is sent async, so we can return early.
                         }
@@ -79,10 +84,7 @@ pub(crate) async fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) 
             };
 
             // Convert PyErr to a string representation to avoid exposing it outside this module.
-            let response = match result {
-                Ok(value) => Ok(value),
-                Err(e) => Err(e.to_string()),
-            };
+            let response = result.map_err(|e| format_py_err(py, &e, cmd.tracebacks));
             let _ = cmd.responder.send(response);
         });
         if let Some(module_globals) = new_globals {
@@ -145,17 +147,17 @@ fn handle_run_file(
     let code = format!(
         r#"
 import sys
-sys.path.insert(0, {})
-with open({}, 'r') as f:
-    exec(f.read())
+sys.path.insert(0, {dir})
+with open({path}, 'r') as f:
+    exec(compile(f.read(), {path}, 'exec'))
 "#,
-        print_path_for_python(
+        dir = print_path_for_python(
             &file
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new(""))
                 .to_path_buf()
         ),
-        print_path_for_python(&file.to_path_buf())
+        path = print_path_for_python(&file.to_path_buf())
     );
     let c_code = python_code_to_cstring(code)?;
     py.run(&c_code, Some(globals), None).map(|_| Value::Null)
@@ -204,28 +206,44 @@ fn vec_to_py_tuple<'py>(
 async fn handle_call_async_function(
     func: Py<PyAny>,
     args: Vec<Value>,
+    tracebacks: bool,
     responder: std_mpsc::Sender<Result<Value, String>>,
 ) {
     let result = Python::attach(|py| {
-        let asyncio = py.import("asyncio")?; // py.import_bound("asyncio")? in newer pyo3
-        let loop_obj = match asyncio.call_method0("get_running_loop") {
-            Ok(loop_obj) => loop_obj,
-            Err(_) => {
-                // If no loop is running, create a new one and set it.
-                let new_loop = asyncio.call_method0("new_event_loop")?;
-                asyncio.call_method1("set_event_loop", (new_loop.clone(),))?;
-                new_loop
-            }
-        };
-
-        // Called after the loop is set, so futures created by `func` bind to this loop.
-        let t_args = vec_to_py_tuple(&py, args)?;
-        let awaitable = wrap_concurrent_future(py, &asyncio, func.bind(py).call1(t_args)?)?;
-        let result = loop_obj.call_method1("run_until_complete", (awaitable,))?;
-
-        py_any_to_json(&result)
+        run_async_function(py, &func, args).map_err(|e| format_py_err(py, &e, tracebacks))
     });
-    let _ = responder.send(result.map_err(|e| e.to_string()));
+    let _ = responder.send(result);
+}
+
+fn run_async_function(py: Python, func: &Py<PyAny>, args: Vec<Value>) -> PyResult<Value> {
+    let asyncio = py.import("asyncio")?;
+    let loop_obj = match asyncio.call_method0("get_running_loop") {
+        Ok(loop_obj) => loop_obj,
+        Err(_) => {
+            // If no loop is running, create a new one and set it.
+            let new_loop = asyncio.call_method0("new_event_loop")?;
+            asyncio.call_method1("set_event_loop", (new_loop.clone(),))?;
+            new_loop
+        }
+    };
+
+    // Called after the loop is set, so futures created by `func` bind to this loop.
+    let t_args = vec_to_py_tuple(&py, args)?;
+    let awaitable = wrap_concurrent_future(py, &asyncio, func.bind(py).call1(t_args)?)?;
+    let result = loop_obj.call_method1("run_until_complete", (awaitable,))?;
+
+    py_any_to_json(&result)
+}
+
+/// Formats an error as `Type: message`, preceded by the traceback (if any) when `tracebacks` is set.
+fn format_py_err(py: Python, err: &PyErr, tracebacks: bool) -> String {
+    if !tracebacks {
+        return err.to_string();
+    }
+    match err.traceback(py).and_then(|tb| tb.format().ok()) {
+        Some(tb) => format!("{tb}{err}"),
+        None => err.to_string(),
+    }
 }
 
 fn wrap_concurrent_future<'py>(

@@ -87,13 +87,7 @@ pub(crate) fn python_thread_main(mut receiver: mpsc::Receiver<PyCommand>) {
                     Ok(Value::Null)
                 }
             };
-            let response = result.map_err(|err| {
-                format!(
-                    "Cannot apply cmd {:?}: {}",
-                    cmd.cmd_type,
-                    print_err_msg(vm, err)
-                )
-            });
+            let response = result.map_err(|err| format_err_msg(vm, err, cmd.tracebacks));
             let _ = cmd.responder.send(response);
         }
     });
@@ -261,24 +255,19 @@ fn items_to_json<'a>(
         .map(Value::Array)
 }
 
-fn print_err_msg(vm: &VirtualMachine, error: PyRef<PyBaseException>) -> String {
+/// Formats an error as `Type: message`, preceded by the traceback (if any) when `tracebacks` is set.
+fn format_err_msg(vm: &VirtualMachine, error: PyRef<PyBaseException>, tracebacks: bool) -> String {
+    if !tracebacks {
+        let name = error.class().name().to_string();
+        return match error.as_object().str(vm).map(|msg| msg.to_string()) {
+            Ok(msg) if !msg.is_empty() => format!("{name}: {msg}"),
+            _ => name,
+        };
+    }
     let mut rendered = String::new();
-    let msg = if vm.write_exception(&mut rendered, &error).is_ok() {
+    if vm.write_exception(&mut rendered, &error).is_ok() {
         rendered.trim().to_owned()
     } else {
         format!("{:?}", error)
-    };
-    println!("error: {}", msg);
-    if let Some(tb) = error.__traceback__() {
-        println!("Traceback (most recent call last):");
-        for trace in tb.iter() {
-            let file = trace.frame.code.source_path.as_str();
-            let line = trace.lineno.get();
-            println!(
-                "  File \"{file}\", line {line}, in {}",
-                trace.frame.code.obj_name
-            );
-        }
     }
-    msg
 }

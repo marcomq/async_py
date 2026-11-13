@@ -69,6 +69,8 @@ pub(crate) enum CmdType {
 /// result back.
 pub(crate) struct PyCommand {
     cmd_type: CmdType,
+    /// Whether a Python error is reported with its traceback or only as `Type: message`.
+    tracebacks: bool,
     responder: std_mpsc::Sender<Result<Value, String>>,
 }
 
@@ -81,7 +83,9 @@ pub enum PyRunnerError {
     #[error("Failed to receive result from Python thread. The thread may have panicked.")]
     ReceiveResultFailed,
 
-    #[error("Python execution error: {0:?}")]
+    /// A Python exception, formatted as `Type: message`. With
+    /// [`PyRunner::with_tracebacks`] the message is preceded by the Python traceback.
+    #[error("Python execution error: {0}")]
     PyError(String),
 
     #[error("Timed out waiting for the Python execution thread")]
@@ -124,6 +128,8 @@ pub struct PyRunner {
     /// thread, so all *subsequent* commands will then also fail with
     /// `PyRunnerError::Timeout` once their own deadlines pass.
     timeout: Option<Duration>,
+    /// Whether `PyRunnerError::PyError` includes the Python traceback; see `with_tracebacks`.
+    tracebacks: bool,
 }
 
 impl Default for PyRunner {
@@ -174,6 +180,7 @@ impl PyRunner {
         Self {
             sender,
             timeout: None,
+            tracebacks: false,
         }
     }
 
@@ -191,6 +198,15 @@ impl PyRunner {
         self
     }
 
+    /// Returns a copy of this `PyRunner` whose `PyRunnerError::PyError` messages
+    /// include the Python traceback, formatted like Python prints an uncaught error.
+    ///
+    /// Disabled by default: errors are then reported as `Type: message` only.
+    pub fn with_tracebacks(mut self, enabled: bool) -> Self {
+        self.tracebacks = enabled;
+        self
+    }
+
     /// A private helper function to encapsulate the logic of sending a command
     /// and receiving a response.
     async fn send_command(&self, cmd_type: CmdType) -> Result<Value, PyRunnerError> {
@@ -200,6 +216,7 @@ impl PyRunner {
         let (responder, receiver) = std_mpsc::channel();
         let cmd = PyCommand {
             cmd_type,
+            tracebacks: self.tracebacks,
             responder,
         };
 
@@ -232,10 +249,12 @@ impl PyRunner {
     fn send_command_sync(&self, cmd_type: CmdType) -> Result<Value, PyRunnerError> {
         let sender = self.sender.clone();
         let timeout = self.timeout;
+        let tracebacks = self.tracebacks;
         let send_and_receive = move || -> Result<Value, PyRunnerError> {
             let (responder, receiver) = std_mpsc::channel();
             let cmd = PyCommand {
                 cmd_type,
+                tracebacks,
                 responder,
             };
 

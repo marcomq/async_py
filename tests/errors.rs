@@ -140,6 +140,57 @@ async fn run_file_with_failing_script_reports_error() {
 }
 
 #[tokio::test]
+async fn error_message_has_no_traceback_by_default() {
+    let runner = PyRunner::new();
+    runner
+        .run("def fail():\n    raise ValueError('bad input')\n")
+        .await
+        .unwrap();
+
+    let message = py_error_message(runner.call_function("fail", vec![]).await);
+
+    assert_eq!(message, "ValueError: bad input");
+}
+
+#[tokio::test]
+async fn error_message_includes_traceback_when_enabled() {
+    let runner = PyRunner::new().with_tracebacks(true);
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_file(
+        dir.path(),
+        "app.py",
+        "def fail():\n    raise ValueError('bad input')\n",
+    );
+    runner.run_file(&script).await.unwrap();
+
+    let message = py_error_message(runner.call_function("fail", vec![]).await);
+
+    assert!(message.starts_with("Traceback"), "{message}");
+    assert!(message.contains("app.py"), "{message}");
+    assert!(message.contains("line 2"), "{message}");
+    assert!(message.ends_with("ValueError: bad input"), "{message}");
+}
+
+#[tokio::test]
+async fn run_file_traceback_points_into_the_script() {
+    let runner = PyRunner::new().with_tracebacks(true);
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_file(
+        dir.path(),
+        "failing.py",
+        "x = 1\nraise RuntimeError('script failed')\n",
+    );
+
+    let message = py_error_message(runner.run_file(&script).await);
+
+    assert!(message.contains("failing.py\", line 2"), "{message}");
+    assert!(
+        message.ends_with("RuntimeError: script failed"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
 async fn run_file_handles_paths_with_spaces_and_quotes() {
     let runner = PyRunner::new();
     let dir = tempfile::tempdir().unwrap();
