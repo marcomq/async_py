@@ -172,6 +172,21 @@ async fn error_message_includes_traceback_when_enabled() {
 }
 
 #[tokio::test]
+async fn traceback_includes_chained_exceptions() {
+    let runner = PyRunner::new().with_tracebacks(true);
+    runner
+        .run("def fail():\n    try:\n        1 / 0\n    except ZeroDivisionError as e:\n        raise ValueError('wrapped') from e\n")
+        .await
+        .unwrap();
+
+    let message = py_error_message(runner.call_function("fail", vec![]).await);
+
+    assert!(message.contains("ZeroDivisionError"), "{message}");
+    assert!(message.contains("direct cause"), "{message}");
+    assert!(message.ends_with("ValueError: wrapped"), "{message}");
+}
+
+#[tokio::test]
 async fn run_file_traceback_points_into_the_script() {
     let runner = PyRunner::new().with_tracebacks(true);
     let dir = tempfile::tempdir().unwrap();

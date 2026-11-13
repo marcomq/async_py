@@ -235,15 +235,24 @@ fn run_async_function(py: Python, func: &Py<PyAny>, args: Vec<Value>) -> PyResul
     py_any_to_json(&result)
 }
 
-/// Formats an error as `Type: message`, preceded by the traceback (if any) when `tracebacks` is set.
+/// Formats an error as `Type: message`; with `tracebacks` set, like Python prints it,
+/// including tracebacks and chained exceptions.
 fn format_py_err(py: Python, err: &PyErr, tracebacks: bool) -> String {
     if !tracebacks {
         return err.to_string();
     }
-    match err.traceback(py).and_then(|tb| tb.format().ok()) {
-        Some(tb) => format!("{tb}{err}"),
-        None => err.to_string(),
-    }
+    format_exception(py, err).unwrap_or_else(|_| err.to_string())
+}
+
+fn format_exception(py: Python, err: &PyErr) -> PyResult<String> {
+    let lines = py.import("traceback")?.call_method1(
+        "format_exception",
+        (err.get_type(py), err.value(py), err.traceback(py)),
+    )?;
+    let joined: String = PyString::new(py, "")
+        .call_method1("join", (lines,))?
+        .extract()?;
+    Ok(joined.trim_end().to_owned())
 }
 
 fn wrap_concurrent_future<'py>(
